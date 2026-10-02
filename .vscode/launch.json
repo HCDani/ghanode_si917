@@ -1,0 +1,26 @@
+{
+    "configurations": [
+        {
+            "name": "wifi_embedded_mqtt_client_soc_silabs_debug:default_config",
+            "cwd": "${workspaceFolder}",
+            "type": "cortex-debug",
+            "request": "launch",
+            "serverpath": "C:/Users/danie/.silabs/slt/installs/archive/exx32-v6.0.32/JLinkGDBServerCL.exe",
+            "servertype": "jlink",
+            "gdbPath": "C:/Users/danie/.silabs/slt/installs/archive/exx32-v6.0.32/arm-none-eabi-gdb.exe",
+            "device": "SiWG917M111MGTBA",
+            "svdFile": "",
+            "runToEntryPoint": "main",
+            "rtos": "FreeRTOS",
+            "showDevDebugOutput": "raw",
+            "executable": "c:/w/cmake_gcc/build/base/wifi_embedded_mqtt_client_soc.out",
+            "preLaunchTask": "wifi_embedded_mqtt_client_soc_silabs_debug:default_config_combined",
+            "breakAfterReset": true,
+            "serialNumber": "440348419",
+            "overrideLaunchCommands": [
+                "exec-file c:/w/cmake_gcc/build/base/wifi_embedded_mqtt_client_soc.out",
+                "symbol-file c:/w/cmake_gcc/build/base/wifi_embedded_mqtt_client_soc.out"
+            ]
+        }
+    ]
+}

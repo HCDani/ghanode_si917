@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="ASCII"?>
+<device:XMLDevice xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:device="http://www.silabs.com/ss/hwconfig/document/device.ecore" name="pin_tool.siwg917m111mgtba" partId="mcu.arm.wfm.siwg917m111mgtba" contextId="com.silabs.sdk.stack.simplicity_sdk:2026.6.1._-731494183-1695203026">
+  <mode name="DefaultMode">
+    <property object="DefaultMode" propertyId="mode.diagramLocation" value="100, 100"/>
+    <property object="GPIO_25" propertyId="pin.name" value=""/>
+    <property object="I2C0" propertyId="ABModule.selectedRequirement" value="i2c0%T%SL_I2C0%T%sl_si91x_i2c_init_i2c0_config.h"/>
+    <property object="I2C0" propertyId="ABPeripheral.included" value="true"/>
+    <property object="PORTIO" propertyId="portio.adc.enable.adcp1" value="Enabled"/>
+    <property object="PORTIO" propertyId="portio.adc.location.adcp1" value="6"/>
+    <property object="PORTIO" propertyId="portio.ulp_i2c.enable.scl" value="Enabled"/>
+    <property object="PORTIO" propertyId="portio.ulp_i2c.enable.sda" value="Enabled"/>
+    <property object="PORTIO" propertyId="portio.ulp_i2c.location.scl" value="2"/>
+    <property object="PORTIO" propertyId="portio.ulp_i2c.location.sda" value="6"/>
+    <property object="PORTIO" propertyId="portio.ulp_uart.enable.rx" value="Enabled"/>
+    <property object="PORTIO" propertyId="portio.ulp_uart.enable.tx" value="Enabled"/>
+    <property object="PORTIO" propertyId="portio.ulp_uart.location.rx" value="3"/>
+    <property object="PORTIO" propertyId="portio.ulp_uart.location.tx" value="1"/>
+    <property object="PORTIO" propertyId="portio.usart0.enable.rx" value="Enabled"/>
+    <property object="PORTIO" propertyId="portio.usart0.enable.tx" value="Enabled"/>
+    <property object="PORTIO" propertyId="portio.usart0.location.rx" value="10"/>
+    <property object="PORTIO" propertyId="portio.usart0.location.tx" value="5"/>
+    <property object="ULP_I2C" propertyId="ABModule.selectedRequirement" value="ulp_i2c%T%SL_ULP_I2C%T%sl_si91x_i2c_init_i2c2_config.h"/>
+    <property object="ULP_I2C" propertyId="ABPeripheral.included" value="true"/>
+    <property object="ULP_UART" propertyId="ABModule.selectedRequirement" value="ulp_uart%T%SL_SI91X_IOSTREAM%T%sl_iostream_usart_vcom_config.h"/>
+    <property object="ULP_UART" propertyId="ABPeripheral.included" value="true"/>
+    <property object="USART0" propertyId="ABModule.selectedRequirement" value="usart0%T%SL_USART0%T%sl_si91x_usart_common_config.h"/>
+    <property object="USART0" propertyId="ABPeripheral.included" value="true"/>
+  </mode>
+  <modeTransition>
+    <property object="RESET &#x2192; DefaultMode" propertyId="modeTransition.source" value="RESET"/>
+    <property object="RESET &#x2192; DefaultMode" propertyId="modeTransition.target" value="DefaultMode"/>
+  </modeTransition>
+</device:XMLDevice>

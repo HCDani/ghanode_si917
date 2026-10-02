@@ -1,0 +1,8 @@
+{
+    "name": "silabs-vscode-extension",
+    "description": "Silicon Labs Simplicity Studio MCP tools for building, debugging, and launching external tools.",
+    "version": "1.0.0",
+    "author": {
+        "name": "Silicon Labs"
+    }
+}

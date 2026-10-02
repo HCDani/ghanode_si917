@@ -1,0 +1,7 @@
+{
+    "cmake.sourceDirectory": "C:/w/cmake_gcc",
+    // CMake is installed by the Silicon Labs SLT tooling rather than system-wide,
+    // so it is not on PATH. Ninja and arm-none-eabi-gcc are resolved by
+    // cmake_gcc/toolchain.cmake and do not need to be set here.
+    "cmake.cmakePath": "C:/Users/danie/.silabs/slt/installs/conan/p/cmakefa35ab0687064/p/bin/cmake.exe"
+}

@@ -1,0 +1,21 @@
+# SDK sources copied into the project by `slc generate -cpsdk`. The .slcp pins
+# the exact versions (simplicity_sdk 2026.6.1, wiseconnect3_sdk 4.1.1), so these
+# trees are reproducible and would otherwise dominate the repository.
+/simplicity_sdk_2026.6.1/
+/wiseconnect3_sdk_4.1.1/
+
+# CMake and Ninja build output, including the binaries and compile_commands.json.
+/cmake_gcc/build/
+
+# Simplicity Studio and Silicon Labs tooling state. Machine-specific or
+# regenerated on every project generation.
+/.uceditor/
+/.silabsExtContext
+/.projectlinkstore
+/vscode.conf
+/trashed_modified_files/
+
+# OS and editor cruft
+Thumbs.db
+.DS_Store
+*.swp

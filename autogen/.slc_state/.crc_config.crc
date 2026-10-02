@@ -1,0 +1,24 @@
+#CRC Codes for initially generated config files -- do not modify!
+FreeRTOSConfig.h=84956561
+RTE_Device_917.h=1181401227
+pin_config.h=-379670672
+sl_board_configuration.h=1054833807
+sl_board_control.h=-682883717
+sl_core_config.h=-1155159984
+sl_gpio_board.h=-1073222429
+sl_iostream_usart_vcom_config.h=-1469838454
+sl_log_common_config.h=-1448287753
+sl_log_formatted_iostream_config.h=705361351
+sl_main_start_task_config.h=-1014157282
+sl_net_default_values.h=1488266404
+sl_si91x_adc_common_config.h=-846683980
+sl_si91x_adc_init_adc0_config.h=392266179
+sl_si91x_dma_config.h=874099485
+sl_si91x_gpio_hp_pin_config.h=1012956322
+sl_si91x_i2c_init_i2c0_config.h=2024456246
+sl_si91x_i2c_init_i2c2_config.h=1413377818
+sl_si91x_si70xx_config.h=-1852632032
+sl_si91x_stack_size_config.h=-1150852864
+sl_si91x_usart_common_config.h=1149627195
+sl_si91x_usart_config.h=-1491177630
+sl_wifi_region_db_config.h=-1614866185

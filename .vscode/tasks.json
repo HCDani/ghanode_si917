@@ -1,0 +1,47 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "wifi_embedded_mqtt_client_soc_silabs_debug:default_config_setup",
+            "type": "shell",
+            "command": "C:/Users/danie/.silabs/slt/installs/conan/p/cmakefa35ab0687064/p/bin/cmake.exe --preset project",
+            "options": {
+                "cwd": "c:/w/cmake_gcc"
+            }
+        },
+        {
+            "label": "wifi_embedded_mqtt_client_soc_silabs_debug:default_config_build",
+            "type": "shell",
+            "command": "C:/Users/danie/.silabs/slt/installs/conan/p/cmakefa35ab0687064/p/bin/cmake.exe --build --preset default_config",
+            "options": {
+                "cwd": "c:/w/cmake_gcc"
+            }
+        },
+        {
+            "label": "wifi_embedded_mqtt_client_soc_silabs_debug:default_config_flash",
+            "type": "shell",
+            "command": "C:/Users/danie/.silabs/slt/installs/archive/Simplicity Commander/commander.exe",
+            "args": [
+                "flash",
+                "c:/w/cmake_gcc/build/base/wifi_embedded_mqtt_client_soc.rps",
+                "--halt",
+                "--serialno",
+                "440348419",
+                "--device",
+                "SIWG917M111MGTBA"
+            ]
+        },
+        {
+            "label": "wifi_embedded_mqtt_client_soc_silabs_debug:default_config_combined",
+            "dependsOrder": "sequence",
+            "presentation": {
+                "reveal": "never"
+            },
+            "dependsOn": [
+                "wifi_embedded_mqtt_client_soc_silabs_debug:default_config_setup",
+                "wifi_embedded_mqtt_client_soc_silabs_debug:default_config_build",
+                "wifi_embedded_mqtt_client_soc_silabs_debug:default_config_flash"
+            ]
+        }
+    ]
+}

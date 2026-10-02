@@ -1,0 +1,5 @@
+# The project builds with arm-none-eabi-gcc. CMSIS selects a compiler-specific
+# header in cmsis_compiler.h, and the SDK ships only cmsis_gcc.h, so clangd must
+# not take the __clang__ branch.
+CompileFlags:
+  Add: [-U__clang__]
