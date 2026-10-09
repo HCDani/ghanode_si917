@@ -48,7 +48,7 @@ extern "C" {
 //   <SL_ADC_FIFO_MODE=> FIFO mode
 //   <SL_ADC_STATIC_MODE=> Static mode
 // <i> Selection of ADC operation mode.
-#define SL_ADC_OPERATION_MODE SL_ADC_FIFO_MODE
+#define SL_ADC_OPERATION_MODE SL_ADC_STATIC_MODE
 
 // </h>
 // <<< end of configuration section >>>

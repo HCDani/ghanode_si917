@@ -52,16 +52,17 @@ extern "C" {
 
 // <o SL_ADC_CHANNEL_1_SAMPLING_RATE> Sampling Rate <1-10000000>
 // <i> Default: 100000
-#define SL_ADC_CHANNEL_1_SAMPLING_RATE 10000
+#define SL_ADC_CHANNEL_1_SAMPLING_RATE 100000
 
 // <o SL_ADC_CHANNEL_1_SAMPLE_LENGTH> Sample Length <1-1023>
 // <i> Default: 1023
-#define SL_ADC_CHANNEL_1_SAMPLE_LENGTH 1023
+#define SL_ADC_CHANNEL_1_SAMPLE_LENGTH 1
 
 // </h>
 // <<< end of configuration section >>>
 
-#define SL_ADC_CHANNEL_1_POS_INPUT_CHNL_SEL 4
+// Pintool ADC_CH1 P is HP GPIO_25 (location 6). POS6 muxes ADC_TOPGPIO25.
+#define SL_ADC_CHANNEL_1_POS_INPUT_CHNL_SEL 6
 #define SL_ADC_CHANNEL_1_NEG_INPUT_CHNL_SEL 0
 
 #else

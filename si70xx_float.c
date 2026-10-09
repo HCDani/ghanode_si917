@@ -148,11 +148,25 @@ static sl_status_t si70xx_transfer(sl_i2c_instance_t i2c_instance,
     tx_buffer[i] = command[i];
   }
 
-  i2c_status = sl_i2c_driver_send_data_blocking(i2c_instance, addr, tx_buffer, command_len);
+  // Si7021 EID and hold-master conversions are write-then-read with a repeated
+  // start. Do not wait for ACTIVITY=0 between the phases: that wait completes
+  // only after a STOP, which aborts the command. The blocking receive then
+  // times out with SL_I2C_TIMEOUT (0x10) because no payload is produced.
+  i2c_status = sl_i2c_driver_enable_repeated_start(i2c_instance, true);
   if (i2c_status != SL_I2C_SUCCESS) {
     return SL_STATUS_IO;
   }
-  si70xx_wait_till_i2c_gets_idle(i2c_instance);
+
+  i2c_status = sl_i2c_driver_send_data_blocking(i2c_instance, addr, tx_buffer, command_len);
+  if (i2c_status != SL_I2C_SUCCESS) {
+    (void)sl_i2c_driver_enable_repeated_start(i2c_instance, false);
+    return SL_STATUS_IO;
+  }
+
+  i2c_status = sl_i2c_driver_enable_repeated_start(i2c_instance, false);
+  if (i2c_status != SL_I2C_SUCCESS) {
+    return SL_STATUS_IO;
+  }
 
   i2c_status = sl_i2c_driver_receive_data_blocking(i2c_instance, addr, response, response_len);
   if (i2c_status != SL_I2C_SUCCESS) {

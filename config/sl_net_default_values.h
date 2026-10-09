@@ -30,6 +30,7 @@
 #pragma once
 
 #include "sl_net_wifi_types.h"
+#include "secret.h"
 
 #if defined(__GNUC__)
 // Ignore warning of unused variables. It is expected that some or all of these are unused
@@ -44,12 +45,20 @@
 #endif
 
 #ifndef DEFAULT_WIFI_CLIENT_PROFILE_SSID
-#define DEFAULT_WIFI_CLIENT_PROFILE_SSID "YOUR_AP_SSID"
+#define DEFAULT_WIFI_CLIENT_PROFILE_SSID SECRET_WIFI_SSID
 #endif
 
 #ifndef DEFAULT_WIFI_CLIENT_CREDENTIAL
-#define DEFAULT_WIFI_CLIENT_CREDENTIAL "YOUR_AP_PASSPHRASE"
+#define DEFAULT_WIFI_CLIENT_CREDENTIAL SECRET_WIFI_PASSWORD
 #endif
+
+// DHCP client hostname (option 12). Firmware copies 31 bytes — keep this buffer that size.
+#ifndef DEFAULT_WIFI_CLIENT_HOST_NAME
+#define DEFAULT_WIFI_CLIENT_HOST_NAME SECRET_WIFI_DHCP_HOSTNAME
+#endif
+
+// Sized for SLI_DHCP_HOSTNAME_MAX_LENGTH (31). Must outlive DHCP bring-up.
+static char default_wifi_client_host_name[31] = DEFAULT_WIFI_CLIENT_HOST_NAME;
 
 #ifndef DEFAULT_WIFI_AP_PROFILE_SSID
 #define DEFAULT_WIFI_AP_PROFILE_SSID "MY_AP_SSID"
@@ -60,17 +69,17 @@
 #endif
 
 #ifndef DEFAULT_WIFI_CLIENT_SECURITY_TYPE
-#define DEFAULT_WIFI_CLIENT_SECURITY_TYPE SL_WIFI_WPA2
+#define DEFAULT_WIFI_CLIENT_SECURITY_TYPE SL_WIFI_WPA3_TRANSITION
 #endif
 
 #ifndef DEFAULT_WIFI_CLIENT_ENCRYPTION_TYPE
 #define DEFAULT_WIFI_CLIENT_ENCRYPTION_TYPE SL_WIFI_DEFAULT_ENCRYPTION
 #endif
 
-//! IP address of the module
-//! E.g: 0x0A0AA8C0 == 192.168.10.10
+//! IP address of the module (used for AP profile / static fallbacks).
+//! E.g: 0x0A000011 == 10.0.0.17
 #ifndef DEFAULT_WIFI_MODULE_IP_ADDRESS
-#define DEFAULT_WIFI_MODULE_IP_ADDRESS 0x0A0AA8C0
+#define DEFAULT_WIFI_MODULE_IP_ADDRESS 0x0A000011
 #endif
 
 //! IP address of netmask
@@ -80,9 +89,9 @@
 #endif
 
 //! IP address of Gateway
-//! E.g: 0x0A0AA8C0 == 192.168.10.10
+//! E.g: 0x0A000001 == 10.0.0.1
 #ifndef DEFAULT_WIFI_GATEWAY_ADDRESS
-#define DEFAULT_WIFI_GATEWAY_ADDRESS 0x0A0AA8C0
+#define DEFAULT_WIFI_GATEWAY_ADDRESS 0x0A000001
 #endif
 
 //For open security networks (SL_WIFI_OPEN), use SL_WIFI_NO_CREDENTIAL_ID.
@@ -108,12 +117,12 @@
     .ip = { \
         .mode = SL_IP_MANAGEMENT_DHCP, \
         .type = REQUIRED_IP_TYPE, \
-        .host_name = NULL, \
+        .host_name = default_wifi_client_host_name, \
         .ip = { \
             .v4 = { \
-                .ip_address = { .value = 0u }, \
-                .gateway = { .value = 0u }, \
-                .netmask = { .value = 0u }, \
+                .ip_address = { .value = 0 }, \
+                .gateway = { .value = 0 }, \
+                .netmask = { .value = 0 }, \
             }, \
             .v6 = { \
                 .link_local_address = { .value = { 0u, 0u, 0u, 0u } }, \

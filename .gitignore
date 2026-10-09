@@ -15,6 +15,12 @@
 /vscode.conf
 /trashed_modified_files/
 
+# Local credentials (use secret_example.h as the template)
+/secret.h
+
+# Capture / debug logs
+/log/
+
 # OS and editor cruft
 Thumbs.db
 .DS_Store

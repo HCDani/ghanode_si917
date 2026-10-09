@@ -29,19 +29,31 @@
  ******************************************************************************/
 
 #include "sl_net.h"
+#include "secret.h"
+#include "sl_net_default_values.h"
 #include "sl_utility.h"
 #include "cmsis_os2.h"
 #include "sl_constants.h"
 #include "sl_mqtt_client.h"
 #include "cacert.pem.h"
 #include "sl_wifi.h"
+#include "sl_wifi_callback_framework.h"
 #include "string.h"
 #include "sl_si91x_si70xx.h"
 #include "sl_i2c_instances.h"
 #include "sl_si91x_driver_gpio.h"
 #include "RTE_Device_917.h"
 #include "si70xx_float.h"
+#include "sl_si91x_adc.h"
+#include "sl_adc_instances.h"
+#include "sl_si91x_adc_common_config.h"
 #include "stdio.h"
+#include "sl_wifi_device.h"
+#include "sl_si91x_socket_utility.h"
+#include "sl_net_ping.h"
+#include "sl_net_wifi_types.h"
+
+extern sl_i2c_pin_init_t sl_i2c_i2c2_pin_init;
 
 /******************************************************
  *                    Constants
@@ -50,22 +62,22 @@
 #ifdef SLI_SI91X_ENABLE_IPV6
 #define MQTT_BROKER_IP "2401:4901:1290:10de::1000"
 #else
-#define MQTT_BROKER_IP "192.168.0.107"
+#define MQTT_BROKER_IP "192.168.6.1"
 #endif
 
-#define MQTT_BROKER_PORT 8886
+#define MQTT_BROKER_PORT 1883
 #define MQTT_BROKER_HOST "yourmqtthost.com"
 
 #define CLIENT_PORT 1
 
 #define CLIENT_ID "WISECONNECT-SDK-MQTT-CLIENT-ID"
 
-#define TOPIC_TO_BE_SUBSCRIBED "THERMOSTAT-DATA\0"
-#define QOS_OF_SUBSCRIPTION    SL_MQTT_QOS_LEVEL_1
-
-#define PUBLISH_TOPIC          "WISECONNECT_SDK_TOPIC"
-#define PUBLISH_MESSAGE        "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do"
+#define PUBLISH_TOPIC          "ghanode/sensor"
 #define QOS_OF_PUBLISH_MESSAGE 0
+
+// "AA:BB:CC:DD:EE:FF" + NUL
+#define SENSOR_ID_MAC_LEN 18
+#define MQTT_JSON_MAX_LEN 208
 
 #define IS_DUPLICATE_MESSAGE 0
 #define IS_MESSAGE_RETAINED  0
@@ -82,16 +94,18 @@
 #define MQTT_CONNECT_TIMEOUT   5000
 #define MQTT_KEEPALIVE_RETRIES 0
 
-#define SEND_CREDENTIALS 0
+#define SEND_CREDENTIALS 1
 
-#define USERNAME "username"
-#define PASSWORD "password"
+#define USERNAME SECRET_MQTT_USERNAME
+#define PASSWORD SECRET_MQTT_PASSWORD
 
 // Si7021 datasheet, Electrical Specifications: tPU from VDD >= 1.9 V to ready
 // for a conversion is 80 ms max over the full temperature range.
 #define SI70XX_POWER_ON_DELAY_MS 80
 
-#define SI70XX_SAMPLE_INTERVAL_MS 5000
+#define SI70XX_SAMPLE_INTERVAL_MS 20000
+
+#define ADC_VREF_VOLTS 3.3f
 
 /******************************************************
  *               Variable Definitions
@@ -124,18 +138,27 @@ static const sl_wifi_device_configuration_t wifi_mqtt_client_configuration = {
   .boot_option = LOAD_NWP_FW,
   .mac_address = NULL,
   .band        = SL_SI91X_WIFI_BAND_2_4GHZ,
+  // US region only scans channels 1–11. EU APs may sit on 12/13.
+  .region_code = SL_WIFI_REGION_EU,
   .boot_config = { .oper_mode              = SL_SI91X_CLIENT_MODE,
                    .coex_mode              = SL_SI91X_WLAN_ONLY_MODE,
                    .feature_bit_map        = (SL_WIFI_FEAT_SECURITY_PSK | SL_WIFI_FEAT_AGGREGATION),
                    .tcp_ip_feature_bit_map = (SL_SI91X_TCP_IP_FEAT_DHCPV4_CLIENT | SL_SI91X_TCP_IP_FEAT_DNS_CLIENT
-                                              | SL_SI91X_TCP_IP_FEAT_SSL | SL_SI91X_TCP_IP_FEAT_EXTENSION_VALID
+                                              | SL_SI91X_TCP_IP_FEAT_ICMP | SL_SI91X_TCP_IP_FEAT_EXTENSION_VALID
+#if ENCRYPT_CONNECTION
+                                              | SL_SI91X_TCP_IP_FEAT_SSL
+#endif
 #ifdef SLI_SI91X_ENABLE_IPV6
                                               | SL_SI91X_TCP_IP_FEAT_DHCPV6_CLIENT | SL_SI91X_TCP_IP_FEAT_IPV6
 #endif
                                               ),
                    .custom_feature_bit_map     = (SL_WIFI_SYSTEM_CUSTOM_FEAT_EXTENSION_VALID),
-                   .ext_custom_feature_bit_map = (SL_SI91X_EXT_FEAT_SSL_VERSIONS_SUPPORT | SL_SI91X_EXT_FEAT_XTAL_CLK
-                                                  | SL_SI91X_EXT_FEAT_UART_SEL_FOR_DEBUG_PRINTS | MEMORY_CONFIG
+                   // Plain MQTT: drop TLS memory reserves; keep 802.11w — this AP uses PMF (sec=8).
+                   .ext_custom_feature_bit_map = (SL_SI91X_EXT_FEAT_XTAL_CLK | SL_SI91X_EXT_FEAT_IEEE_80211W
+                                                  | MEMORY_CONFIG
+#if ENCRYPT_CONNECTION
+                                                  | SL_SI91X_EXT_FEAT_SSL_VERSIONS_SUPPORT
+#endif
 #ifdef SLI_SI917
                                                   | SL_SI91X_EXT_FEAT_FRONT_END_SWITCH_PINS_ULP_GPIO_4_5_0
 #endif
@@ -143,11 +166,17 @@ static const sl_wifi_device_configuration_t wifi_mqtt_client_configuration = {
                    .bt_feature_bit_map = 0,
                    .ext_tcp_ip_feature_bit_map =
                      (SL_SI91X_EXT_TCP_IP_WINDOW_SCALING | SL_SI91X_EXT_TCP_IP_TOTAL_SELECTS(10)
+                      | SL_SI91X_EXT_TCP_IP_WAIT_FOR_SOCKET_CLOSE | SL_SI91X_EXT_EMB_MQTT_ENABLE
+                      | SL_SI91X_CONFIG_FEAT_EXTENSION_VALID
+#if ENCRYPT_CONNECTION
                       | SL_SI91X_EXT_TCP_IP_FEAT_SSL_THREE_SOCKETS | SL_SI91X_EXT_TCP_IP_FEAT_SSL_MEMORY_CLOUD
-                      | SL_SI91X_EXT_EMB_MQTT_ENABLE),
+#endif
+                      ),
                    .ble_feature_bit_map     = 0,
                    .ble_ext_feature_bit_map = 0,
-                   .config_feature_bit_map  = 0 },
+                   // Required for NWP timestamp memory + captive-core logging.
+                   .config_feature_bit_map  = SL_SI91X_ENABLE_NWP_LOGGING },
+  // 0/0/0 = SDK default pool split (stock MQTT example). Non-zero 1/1/1 is unused.
   .ta_pool         = { .tx_ratio_in_buffer_pool = 0, .rx_ratio_in_buffer_pool = 0, .global_ratio_in_buffer_pool = 0 },
   .efuse_data_type = SL_SI91X_EFUSE_MFG_SW_VERSION,
   .nwp_fw_image_number = SL_SI91X_NWP_FW_IMAGE_NUMBER_0
@@ -156,6 +185,10 @@ static const sl_wifi_device_configuration_t wifi_mqtt_client_configuration = {
 sl_mqtt_client_t client = { 0 };
 
 uint8_t is_execution_completed = 0;
+static volatile uint8_t mqtt_is_connected  = 0;
+static volatile uint8_t mqtt_publish_busy  = 0;
+static char mqtt_json_payload[MQTT_JSON_MAX_LEN];
+static char sensor_id_mac[SENSOR_ID_MAC_LEN] = "00:00:00:00:00:00";
 
 sl_mqtt_client_credentials_t *client_credentails = NULL;
 
@@ -191,8 +224,8 @@ sl_mqtt_client_message_t message_to_be_published = {
   .is_duplicate_message = IS_DUPLICATE_MESSAGE,
   .topic                = (uint8_t *)PUBLISH_TOPIC,
   .topic_length         = strlen(PUBLISH_TOPIC),
-  .content              = (uint8_t *)PUBLISH_MESSAGE,
-  .content_length       = strlen(PUBLISH_MESSAGE),
+  .content              = (uint8_t *)mqtt_json_payload,
+  .content_length       = 0,
 };
 
 sl_mqtt_client_last_will_message_t last_will_message = {
@@ -210,12 +243,26 @@ sl_mqtt_client_last_will_message_t last_will_message = {
 static void application_start(void *argument);
 static void sensor_task(void *argument);
 static sl_status_t si70xx_enable_sensor(void);
-void mqtt_client_message_handler(void *client, sl_mqtt_client_message_t *message, void *context);
+static void adc_event_callback(uint8_t channel, uint8_t event);
+static sl_status_t adc_ch1_init(void);
+static sl_status_t adc_ch1_read_volts(float *volts);
+static void format_sensor_timestamp(char *buf, size_t buf_len);
+static void publish_sensor_json(float temperature_c, float humidity_pct, int light);
+static sl_status_t wifi_scan_callback(sl_wifi_event_t event,
+                                      sl_wifi_scan_result_t *result,
+                                      uint32_t result_length,
+                                      void *arg);
+static void dump_nearby_access_points(void);
+static sl_status_t apply_dhcp_client_profile(const sl_mac_address_t *bssid, uint8_t channel);
+static sl_status_t network_event_handler(sl_net_event_t event, sl_status_t status, void *data, uint32_t data_length);
+static void dump_station_ip_config(void);
+static void icmp_probe_gateway(void);
+static void network_tcp_prepare(void);
 void mqtt_client_event_handler(void *client, sl_mqtt_client_event_t event, void *event_data, void *context);
 void mqtt_client_error_event_handler(void *client, sl_mqtt_client_error_status_t *error);
 void mqtt_client_cleanup();
 void print_char_buffer(char *buffer, uint32_t buffer_length);
-sl_status_t mqtt_example();
+sl_status_t mqtt_connect(void);
 
 /******************************************************
  *               Function Definitions
@@ -226,36 +273,298 @@ void app_init(void)
   osThreadNew((osThreadFunc_t)application_start, NULL, &thread_attributes);
 }
 
+static osSemaphoreId_t wifi_scan_sem = NULL;
+static osSemaphoreId_t ping_sem      = NULL;
+static volatile sl_status_t ping_status = SL_STATUS_FAIL;
+static uint8_t wifi_target_found     = 0;
+static uint8_t wifi_target_channel   = 0;
+static uint8_t wifi_target_rssi      = 0xFF;
+static uint8_t wifi_target_security  = 0;
+static sl_mac_address_t wifi_target_bssid;
+
+static sl_status_t wifi_scan_callback(sl_wifi_event_t event,
+                                      sl_wifi_scan_result_t *result,
+                                      uint32_t result_length,
+                                      void *arg)
+{
+  UNUSED_PARAMETER(result_length);
+  UNUSED_PARAMETER(arg);
+
+  const char *wanted = DEFAULT_WIFI_CLIENT_PROFILE_SSID;
+  const size_t wanted_len = sizeof(DEFAULT_WIFI_CLIENT_PROFILE_SSID) - 1u;
+
+  if (SL_WIFI_CHECK_IF_EVENT_FAILED(event)) {
+    sl_status_t status = SL_STATUS_FAIL;
+    if (result != NULL) {
+      status = *(sl_status_t *)result;
+    }
+    printf("Wi-Fi scan failed: 0x%lx\r\n", (unsigned long)status);
+  } else if ((result == NULL) || (result->scan_count == 0u)) {
+    printf("Wi-Fi scan: 0 APs\r\n");
+  } else {
+    printf("Wi-Fi scan: %lu AP(s)\r\n", (unsigned long)result->scan_count);
+    for (uint32_t i = 0; i < result->scan_count; i++) {
+      char ssid[SL_WIFI_MAX_SSID_LENGTH + 1u];
+      memset(ssid, 0, sizeof(ssid));
+      memcpy(ssid, result->scan_info[i].ssid, SL_WIFI_MAX_SSID_LENGTH);
+      const uint8_t *bssid = result->scan_info[i].bssid;
+      printf("  ssid=\"%s\" ch=%u rssi=-%u sec=%u bssid=%02X:%02X:%02X:%02X:%02X:%02X\r\n",
+             ssid,
+             (unsigned)result->scan_info[i].rf_channel,
+             (unsigned)result->scan_info[i].rssi_val,
+             (unsigned)result->scan_info[i].security_mode,
+             bssid[0],
+             bssid[1],
+             bssid[2],
+             bssid[3],
+             bssid[4],
+             bssid[5]);
+
+      if (strncmp(ssid, wanted, wanted_len) != 0) {
+        continue;
+      }
+      if ((ssid[wanted_len] != '\0') && (wanted_len < SL_WIFI_MAX_SSID_LENGTH)) {
+        continue;
+      }
+      // Prefer stronger RSSI; on a tie keep the first match (do not walk to a later AP).
+      if (wifi_target_found && (result->scan_info[i].rssi_val >= wifi_target_rssi)) {
+        continue;
+      }
+      wifi_target_found    = 1;
+      wifi_target_rssi     = result->scan_info[i].rssi_val;
+      wifi_target_channel  = result->scan_info[i].rf_channel;
+      wifi_target_security = result->scan_info[i].security_mode;
+      memcpy(wifi_target_bssid.octet, bssid, sizeof(wifi_target_bssid.octet));
+    }
+  }
+
+  if (wifi_scan_sem != NULL) {
+    osSemaphoreRelease(wifi_scan_sem);
+  }
+  return SL_STATUS_OK;
+}
+
+static void dump_nearby_access_points(void)
+{
+  sl_status_t status;
+
+  wifi_target_found   = 0;
+  wifi_target_rssi    = 0xFF;
+  wifi_target_channel = 0;
+  memset(wifi_target_bssid.octet, 0, sizeof(wifi_target_bssid.octet));
+
+  if (wifi_scan_sem == NULL) {
+    wifi_scan_sem = osSemaphoreNew(1, 0, NULL);
+  }
+
+  sl_wifi_set_scan_callback(wifi_scan_callback, NULL);
+  printf("Scanning for 2.4 GHz APs (looking for \"%s\")...\r\n", DEFAULT_WIFI_CLIENT_PROFILE_SSID);
+  status = sl_wifi_start_scan(SL_WIFI_CLIENT_2_4GHZ_INTERFACE, NULL, &default_wifi_scan_configuration);
+  if ((status != SL_STATUS_OK) && (status != SL_STATUS_IN_PROGRESS)) {
+    printf("sl_wifi_start_scan failed: 0x%lx\r\n", (unsigned long)status);
+    return;
+  }
+
+  if (osSemaphoreAcquire(wifi_scan_sem, 30000) != osOK) {
+    printf("Wi-Fi scan timed out\r\n");
+    return;
+  }
+
+  if (wifi_target_found == 0u) {
+    printf("No matching AP \"%s\" in scan results\r\n", DEFAULT_WIFI_CLIENT_PROFILE_SSID);
+    return;
+  }
+
+  status = apply_dhcp_client_profile(&wifi_target_bssid, wifi_target_channel);
+  if (status != SL_STATUS_OK) {
+    printf("apply_dhcp_client_profile failed: 0x%lx\r\n", (unsigned long)status);
+    return;
+  }
+
+  printf("Joining \"%s\" ch=%u rssi=-%u sec=%u bssid=%02X:%02X:%02X:%02X:%02X:%02X (DHCP)\r\n",
+         DEFAULT_WIFI_CLIENT_PROFILE_SSID,
+         (unsigned)wifi_target_channel,
+         (unsigned)wifi_target_rssi,
+         (unsigned)wifi_target_security,
+         wifi_target_bssid.octet[0],
+         wifi_target_bssid.octet[1],
+         wifi_target_bssid.octet[2],
+         wifi_target_bssid.octet[3],
+         wifi_target_bssid.octet[4],
+         wifi_target_bssid.octet[5]);
+}
+
+static sl_status_t apply_dhcp_client_profile(const sl_mac_address_t *bssid, uint8_t channel)
+{
+  sl_net_wifi_client_profile_t profile = DEFAULT_WIFI_CLIENT_PROFILE;
+
+  if (bssid != NULL) {
+    profile.config.bssid           = *bssid;
+    profile.config.channel.channel = channel;
+    profile.config.channel.band    = SL_WIFI_BAND_2_4GHZ;
+  }
+
+  return sl_net_set_profile(SL_NET_WIFI_CLIENT_INTERFACE, SL_NET_DEFAULT_WIFI_CLIENT_PROFILE_ID, &profile);
+}
+
 static sl_status_t si70xx_enable_sensor(void)
 {
   sl_status_t status;
-  sl_si91x_gpio_pin_config_t sensor_enable_pin = {
-    .port_pin.port = (sl_gpio_port_t)SL_GPIO_UULP_PORT,
-    .port_pin.pin  = SENSOR_ENABLE_GPIO_PIN,
-    .direction     = GPIO_OUTPUT,
-  };
+  uint8_t pin_status;
+  uint8_t pin_dir;
+  // MCU_RET NPSS_GPIO_CNTRL[n] lives at 0x2404861C + 4*n; same as UULP pad config.
+  volatile uint32_t *const sensor_enable_ctrl =
+    (volatile uint32_t *)(0x2404861CUL + (4UL * (uint32_t)SENSOR_ENABLE_GPIO_PIN));
 
-  status = sl_si91x_gpio_driver_enable_clock(ULPCLK_GPIO);
+  // The Si7021 is on the WSTK mainboard, isolated from radio-board ULP_I2C until
+  // SENSOR_ENABLE (UULP_VBAT_GPIO_1) is configured as an M4-owned GPIO output high.
+  status = sl_si91x_gpio_driver_enable_clock((sl_si91x_gpio_select_clock_t)ULPCLK_GPIO);
   if (status != SL_STATUS_OK) {
     SL_DEBUG_LOG_V2(ERROR, "Failed to enable GPIO clock for Si70xx: 0x%lx\r\n", status);
     return status;
   }
 
-  status = sl_gpio_set_configuration(sensor_enable_pin);
+  uulp_pad_config_t pad_config = {
+    .gpio_padnum = SENSOR_ENABLE_GPIO_PIN,
+    .mode        = NPSS_GPIO_PIN_MUX_MODE0,
+    .receiver    = GPIO_RECEIVER_EN, // needed for STATUS/readback to reflect the pad
+    .direction   = GPIO_OUTPUT,      // OEN=0 => output
+    .output      = GPIO_PIN_SET,
+    .pad_select  = GPIO_PAD_M4, // MCU (not NWP) owns the pad
+    .polarity    = GPIO_POLARITY_0,
+  };
+
+  status = sl_si91x_gpio_driver_set_uulp_pad_configuration(&pad_config);
   if (status != SL_STATUS_OK) {
-    SL_DEBUG_LOG_V2(ERROR, "Failed to configure Si70xx enable pin: 0x%lx\r\n", status);
+    SL_DEBUG_LOG_V2(ERROR, "Failed to configure Si70xx enable pad: 0x%lx\r\n", status);
     return status;
   }
 
+  // Force OUT again after pad config; some paths leave the latch stale.
   status = sl_si91x_gpio_driver_set_uulp_npss_pin_value(SENSOR_ENABLE_GPIO_PIN, GPIO_PIN_SET);
   if (status != SL_STATUS_OK) {
     SL_DEBUG_LOG_V2(ERROR, "Failed to set Si70xx enable pin high: 0x%lx\r\n", status);
     return status;
   }
 
+  pin_dir    = sl_si91x_gpio_driver_get_uulp_npss_direction(SENSOR_ENABLE_GPIO_PIN);
+  pin_status = sl_si91x_gpio_driver_get_uulp_npss_pin(SENSOR_ENABLE_GPIO_PIN);
+  SL_DEBUG_LOG_V2(INFO,
+                  "SENSOR_ENABLE ctrl=0x%08lx dir=%u status=%u out=%u\r\n",
+                  (unsigned long)*sensor_enable_ctrl,
+                  (unsigned)pin_dir,
+                  (unsigned)pin_status,
+                  (unsigned)((*sensor_enable_ctrl >> 5) & 0x1u));
+
+  if (((*sensor_enable_ctrl >> 5) & 0x1u) == 0u) {
+    SL_DEBUG_LOG_V2(ERROR, "SENSOR_ENABLE OUT latch is still 0\r\n");
+    return SL_STATUS_FAIL;
+  }
 
   osDelay(SI70XX_POWER_ON_DELAY_MS);
   return SL_STATUS_OK;
+}
+
+static void adc_event_callback(uint8_t channel, uint8_t event)
+{
+  UNUSED_PARAMETER(channel);
+  UNUSED_PARAMETER(event);
+}
+
+static sl_status_t adc_ch1_init(void)
+{
+  sl_status_t status;
+
+  sl_adc_channel_config.channel = SL_ADC_CHANNEL_1;
+
+  status = sl_si91x_adc_init(sl_adc_channel_config, sl_adc_config, ADC_VREF_VOLTS);
+  if (status != SL_STATUS_OK) {
+    SL_DEBUG_LOG_V2(ERROR, "ADC init failed: 0x%lx\r\n", status);
+    return status;
+  }
+
+  status = sl_si91x_adc_set_channel_configuration(sl_adc_channel_config, sl_adc_config);
+  if (status != SL_STATUS_OK) {
+    SL_DEBUG_LOG_V2(ERROR, "ADC channel config failed: 0x%lx\r\n", status);
+    return status;
+  }
+
+  status = sl_si91x_adc_register_event_callback(adc_event_callback);
+  if (status != SL_STATUS_OK) {
+    SL_DEBUG_LOG_V2(ERROR, "ADC callback register failed: 0x%lx\r\n", status);
+    return status;
+  }
+
+  status = sl_si91x_adc_start(sl_adc_config);
+  if (status != SL_STATUS_OK) {
+    SL_DEBUG_LOG_V2(ERROR, "ADC start failed: 0x%lx\r\n", status);
+    return status;
+  }
+
+  SL_DEBUG_LOG_V2(INFO, "ADC CH1 GPIO_25 started\r\n");
+  return SL_STATUS_OK;
+}
+
+static sl_status_t adc_ch1_read_volts(float *volts)
+{
+  uint16_t adc_value = 0;
+  sl_status_t status = sl_si91x_adc_read_data_static(sl_adc_channel_config, sl_adc_config, &adc_value);
+  if (status != SL_STATUS_OK) {
+    return status;
+  }
+
+  // RSI_ADC_GainOffsetCal returns offset-binary (XOR 0x800). Undo that to a
+  // 12-bit unipolar count: 0 = 0 V, 4095 = VREF.
+  const uint16_t unipolar = (uint16_t)((adc_value & 0x0FFFu) ^ 0x800u);
+  *volts                  = ((float)unipolar / 4096.0f) * ADC_VREF_VOLTS;
+  printf("ADC CH1 raw=0x%03x count=%u\r\n", (unsigned)(adc_value & 0x0FFFu), (unsigned)unipolar);
+  return SL_STATUS_OK;
+}
+
+static void format_sensor_timestamp(char *buf, size_t buf_len)
+{
+  // No NTP yet (NWP timesync failed during init). Stamp uptime as HH:MM:SS
+  // on today's build date, using the offset style from the requested JSON.
+  const uint32_t total_sec = osKernelGetTickCount() / 1000u;
+  const uint32_t hh        = (total_sec / 3600u) % 24u;
+  const uint32_t mm        = (total_sec / 60u) % 60u;
+  const uint32_t ss        = total_sec % 60u;
+  snprintf(buf, buf_len, "2026-10-06T%02lu:%02lu:%02luZ+200", (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
+}
+
+static void publish_sensor_json(float temperature_c, float humidity_pct, int light)
+{
+  char timestamp[40];
+  int n;
+
+  if ((mqtt_is_connected == 0u) || (mqtt_publish_busy != 0u)) {
+    return;
+  }
+
+  format_sensor_timestamp(timestamp, sizeof(timestamp));
+  n = snprintf(mqtt_json_payload,
+               sizeof(mqtt_json_payload),
+               "{\"Sensor ID\": \"%s\", \"timestamp\":\"%s\", \"temperature\":%.1f, \"humidity\": %d, \"light\": %d}",
+               sensor_id_mac,
+               timestamp,
+               temperature_c,
+               (int)(humidity_pct + (humidity_pct >= 0.0f ? 0.5f : -0.5f)),
+               light);
+  if ((n <= 0) || ((size_t)n >= sizeof(mqtt_json_payload))) {
+    printf("MQTT JSON format failed\r\n");
+    return;
+  }
+
+  message_to_be_published.content        = (uint8_t *)mqtt_json_payload;
+  message_to_be_published.content_length = (uint16_t)n;
+  mqtt_publish_busy                      = 1;
+  sl_status_t status = sl_mqtt_client_publish(&client, &message_to_be_published, 0, &message_to_be_published);
+  if (status != SL_STATUS_IN_PROGRESS) {
+    mqtt_publish_busy = 0;
+    printf("MQTT publish failed: 0x%lx\r\n", (unsigned long)status);
+    return;
+  }
+  printf("MQTT publish: %s\r\n", mqtt_json_payload);
 }
 
 // Runs independently of Wi-Fi and MQTT so readings keep coming even when the
@@ -267,17 +576,173 @@ static void sensor_task(void *argument)
   while (1) {
     float humidity_pct  = 0.0f;
     float temperature_c = 0.0f;
+    float adc_volts     = 0.0f;
+    int light           = 0;
+    sl_status_t status;
 
-    sl_status_t status =
-      si70xx_float_measure_rh_and_temp(SI70XX_I2C_INSTANCE, SI70XX_SLAVE_ADDR, &humidity_pct, &temperature_c);
+    status = si70xx_float_measure_rh_and_temp(SI70XX_I2C_INSTANCE, SI70XX_SLAVE_ADDR, &humidity_pct, &temperature_c);
     if (status == SL_STATUS_OK) {
       printf("Si7021: %.2f C, %.2f %%RH\r\n", temperature_c, humidity_pct);
     } else {
       printf("Si7021: measurement failed, 0x%lx\r\n", (unsigned long)status);
     }
 
+    status = adc_ch1_read_volts(&adc_volts);
+    if (status == SL_STATUS_OK) {
+      light = (int)(adc_volts * 1000.0f + (adc_volts >= 0.0f ? 0.5f : -0.5f));
+      printf("ADC CH1 GPIO_25: %.3f V\r\n", adc_volts);
+      publish_sensor_json(temperature_c, humidity_pct, light);
+    } else {
+      printf("ADC CH1: read failed, 0x%lx\r\n", (unsigned long)status);
+      publish_sensor_json(temperature_c, humidity_pct, 0);
+    }
+
     osDelay(SI70XX_SAMPLE_INTERVAL_MS);
   }
+}
+
+static sl_status_t network_event_handler(sl_net_event_t event, sl_status_t status, void *data, uint32_t data_length)
+{
+  UNUSED_PARAMETER(data_length);
+
+  switch (event) {
+    case SL_NET_PING_RESPONSE_EVENT: {
+      sl_net_ping_response_t *response = (sl_net_ping_response_t *)data;
+      ping_status                      = status;
+      if (status != SL_STATUS_OK) {
+        SL_DEBUG_LOG_V2(ERROR, "ICMP: ping failed status=0x%lx\r\n", (unsigned long)status);
+      } else if (response != NULL) {
+        SL_DEBUG_LOG_V2(INFO,
+                        "ICMP: %u bytes from %u.%u.%u.%u\r\n",
+                        (unsigned)response->ping_size,
+                        response->ping_address.ipv4_address[0],
+                        response->ping_address.ipv4_address[1],
+                        response->ping_address.ipv4_address[2],
+                        response->ping_address.ipv4_address[3]);
+      }
+      if (ping_sem != NULL) {
+        osSemaphoreRelease(ping_sem);
+      }
+      break;
+    }
+    case SL_NET_DHCP_NOTIFICATION_EVENT:
+      SL_DEBUG_LOG_V2(INFO, "DHCP notification status=0x%lx\r\n", (unsigned long)status);
+      break;
+    case SL_NET_IP_ADDRESS_CHANGE_EVENT: {
+      sl_net_ip_configuration_t *ip_config = (sl_net_ip_configuration_t *)data;
+      if (ip_config != NULL) {
+        SL_DEBUG_LOG_V2(INFO,
+                        "IP change status=0x%lx ip=%u.%u.%u.%u gw=%u.%u.%u.%u mask=%u.%u.%u.%u\r\n",
+                        (unsigned long)status,
+                        ip_config->ip.v4.ip_address.bytes[0],
+                        ip_config->ip.v4.ip_address.bytes[1],
+                        ip_config->ip.v4.ip_address.bytes[2],
+                        ip_config->ip.v4.ip_address.bytes[3],
+                        ip_config->ip.v4.gateway.bytes[0],
+                        ip_config->ip.v4.gateway.bytes[1],
+                        ip_config->ip.v4.gateway.bytes[2],
+                        ip_config->ip.v4.gateway.bytes[3],
+                        ip_config->ip.v4.netmask.bytes[0],
+                        ip_config->ip.v4.netmask.bytes[1],
+                        ip_config->ip.v4.netmask.bytes[2],
+                        ip_config->ip.v4.netmask.bytes[3]);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return SL_STATUS_OK;
+}
+
+static void dump_station_ip_config(void)
+{
+  sl_net_wifi_client_profile_t profile;
+  sl_status_t status;
+
+  status = sl_net_get_profile(SL_NET_WIFI_CLIENT_INTERFACE, SL_NET_DEFAULT_WIFI_CLIENT_PROFILE_ID, &profile);
+  if (status != SL_STATUS_OK) {
+    SL_DEBUG_LOG_V2(ERROR, "IP dump: get_profile failed 0x%lx\r\n", (unsigned long)status);
+    return;
+  }
+
+  SL_DEBUG_LOG_V2(INFO,
+                  "STA ip=%u.%u.%u.%u gw=%u.%u.%u.%u mask=%u.%u.%u.%u host=%s\r\n",
+                  profile.ip.ip.v4.ip_address.bytes[0],
+                  profile.ip.ip.v4.ip_address.bytes[1],
+                  profile.ip.ip.v4.ip_address.bytes[2],
+                  profile.ip.ip.v4.ip_address.bytes[3],
+                  profile.ip.ip.v4.gateway.bytes[0],
+                  profile.ip.ip.v4.gateway.bytes[1],
+                  profile.ip.ip.v4.gateway.bytes[2],
+                  profile.ip.ip.v4.gateway.bytes[3],
+                  profile.ip.ip.v4.netmask.bytes[0],
+                  profile.ip.ip.v4.netmask.bytes[1],
+                  profile.ip.ip.v4.netmask.bytes[2],
+                  profile.ip.ip.v4.netmask.bytes[3],
+                  (profile.ip.host_name != NULL) ? profile.ip.host_name : "(null)");
+}
+
+// ICMP echo to MQTT_BROKER_IP — proves whether NWP can ARP outside SOCKET_CREATE.
+static void icmp_probe_gateway(void)
+{
+  sl_ip_address_t remote = { 0 };
+  sl_status_t status;
+  const uint32_t t0 = osKernelGetTickCount();
+
+  if (ping_sem == NULL) {
+    ping_sem = osSemaphoreNew(1, 0, NULL);
+  }
+  while (osSemaphoreAcquire(ping_sem, 0) == osOK) {
+  }
+  ping_status = SL_STATUS_FAIL;
+
+  status = sl_net_inet_addr(MQTT_BROKER_IP, (uint32_t *)&remote.ip.v4);
+  if (status != SL_STATUS_OK) {
+    SL_DEBUG_LOG_V2(ERROR, "ICMP: bad target IP\r\n");
+    return;
+  }
+  remote.type = SL_IPV4;
+
+  SL_DEBUG_LOG_V2(INFO, "ICMP: ping %s ...\r\n", MQTT_BROKER_IP);
+  status = sl_si91x_send_ping(remote, 64);
+  if (status != SL_STATUS_IN_PROGRESS) {
+    SL_DEBUG_LOG_V2(ERROR, "ICMP: send_ping status=0x%lx\r\n", (unsigned long)status);
+    return;
+  }
+
+  if (osSemaphoreAcquire(ping_sem, 10000) != osOK) {
+    SL_DEBUG_LOG_V2(ERROR,
+                    "ICMP: no reply after %lu ms (watch capture for ARP/ICMP)\r\n",
+                    (unsigned long)(osKernelGetTickCount() - t0));
+    return;
+  }
+
+  SL_DEBUG_LOG_V2(INFO,
+                  "ICMP: done status=0x%lx after %lu ms\r\n",
+                  (unsigned long)ping_status,
+                  (unsigned long)(osKernelGetTickCount() - t0));
+}
+
+// Prepare NWP TCP socket pool before MQTT connect.
+static void network_tcp_prepare(void)
+{
+  sl_status_t status;
+  const sl_si91x_socket_config_t socket_cfg = {
+    .total_sockets                   = 3,
+    .total_tcp_sockets               = 2,
+    .total_udp_sockets               = 1,
+    .tcp_tx_only_sockets             = 1,
+    .tcp_rx_only_sockets             = 1,
+    .udp_tx_only_sockets             = 1,
+    .udp_rx_only_sockets             = 0,
+    .tcp_rx_high_performance_sockets = 1,
+    .tcp_rx_window_size_cap          = 10,
+    .tcp_rx_window_div_factor        = 0,
+  };
+
+  status = sl_si91x_config_socket(socket_cfg);
+  SL_DEBUG_LOG_V2(INFO, "TCP prepare: config_socket status=0x%lx\r\n", (unsigned long)status);
 }
 
 static void application_start(void *argument)
@@ -286,25 +751,115 @@ static void application_start(void *argument)
   sl_status_t status;
   sl_i2c_status_t i2c_status;
 
+  // Bring up the NWP before touching ULP I2C / SENSOR_ENABLE. Host WLAN threads
+  // are created first, then sli_si91x_bootup_firmware() waits for TA_is_active
+  // with no timeout; ULP activity during that window can leave the app stuck
+  // after "Thread priority order is correct" with no error return.
+  SL_DEBUG_LOG_V2(INFO, "Starting Wi-Fi (sl_net_init)...\r\n");
+  status = sl_net_init(SL_NET_WIFI_CLIENT_INTERFACE, &wifi_mqtt_client_configuration, NULL, network_event_handler);
+  if (status != SL_STATUS_OK && status != SL_STATUS_ALREADY_INITIALIZED) {
+    SL_DEBUG_LOG_V2(ERROR, "Failed to start Wi-Fi client interface: 0x%lx\r\n", status);
+    return;
+  }
+  SL_DEBUG_LOG_V2(INFO, "Wi-Fi client interface up Success\r\n");
+
+  dump_nearby_access_points();
+  osDelay(500);
+
+  sl_wifi_configure_timeout(SL_WIFI_CLIENT_2_4GHZ_INTERFACE, SL_WIFI_AUTHENTICATION_ASSOCIATION_TIMEOUT, 3000);
+  const sl_wifi_advanced_client_configuration_t advanced_client_config = {
+    .max_retry_attempts      = 5,
+    .scan_interval           = 4,
+    .beacon_missed_count     = 40,
+    .first_time_retry_enable = 1,
+  };
+  sl_wifi_set_advanced_client_configuration(SL_WIFI_CLIENT_2_4GHZ_INTERFACE, &advanced_client_config);
+
+  SL_DEBUG_LOG_V2(INFO, "Joining Wi-Fi (sl_net_up)...\r\n");
+  status = sl_net_up(SL_NET_WIFI_CLIENT_INTERFACE, SL_NET_DEFAULT_WIFI_CLIENT_PROFILE_ID);
+  if (status != SL_STATUS_OK) {
+    SL_DEBUG_LOG_V2(ERROR, "Failed to bring Wi-Fi client interface up: 0x%lx\r\n", status);
+    return;
+  }
+  SL_DEBUG_LOG_V2(INFO, "Wi-Fi client connected\r\n");
+
+  {
+    sl_mac_address_t sta_mac          = { 0 };
+    sl_wifi_firmware_version_t fw_ver = { 0 };
+    sl_wifi_performance_profile_v2_t perf = {
+      .profile = SL_WIFI_SYSTEM_HIGH_PERFORMANCE,
+    };
+    if (sl_wifi_get_mac_address(SL_WIFI_CLIENT_INTERFACE, &sta_mac) == SL_STATUS_OK) {
+      snprintf(sensor_id_mac,
+               sizeof(sensor_id_mac),
+               "%02X:%02X:%02X:%02X:%02X:%02X",
+               sta_mac.octet[0],
+               sta_mac.octet[1],
+               sta_mac.octet[2],
+               sta_mac.octet[3],
+               sta_mac.octet[4],
+               sta_mac.octet[5]);
+      SL_DEBUG_LOG_V2(INFO, "STA mac=%s (sensor id)\r\n", sensor_id_mac);
+    }
+    if (sl_wifi_get_firmware_version(&fw_ver) == SL_STATUS_OK) {
+      SL_DEBUG_LOG_V2(INFO,
+                      "NWP fw %u.%u.%u.%u.%u.%u build=%u\r\n",
+                      (unsigned)fw_ver.chip_id,
+                      (unsigned)fw_ver.rom_id,
+                      (unsigned)fw_ver.major,
+                      (unsigned)fw_ver.minor,
+                      (unsigned)fw_ver.security_version,
+                      (unsigned)fw_ver.patch_num,
+                      (unsigned)fw_ver.build_num);
+    }
+    sl_status_t perf_status = sl_wifi_set_performance_profile_v2(&perf);
+    SL_DEBUG_LOG_V2(INFO, "performance HIGH status=0x%lx\r\n", (unsigned long)perf_status);
+  }
+
+  dump_station_ip_config();
+  // Socket pool — needed before any TCP open / ARP.
+  network_tcp_prepare();
+  icmp_probe_gateway();
+
   status = si70xx_enable_sensor();
   if (status != SL_STATUS_OK) {
     return;
   }
-  SL_DEBUG_LOG_V2(INFO, "Si70xx enable pin high\r\n");
+  SL_DEBUG_LOG_V2(INFO, "Si70xx enable pin high v21\r\n");
+
+  i2c_status = sl_si91x_i2c_pin_init(&sl_i2c_i2c2_pin_init);
+  if (i2c_status != SL_I2C_SUCCESS) {
+    SL_DEBUG_LOG_V2(ERROR, "Failed to pin-init I2C for Si70xx: 0x%lx\r\n", i2c_status);
+    return;
+  }
 
   i2c_status = sl_i2c_driver_init(SI70XX_I2C_INSTANCE, &sl_i2c_i2c2_config);
   if (i2c_status != SL_I2C_SUCCESS) {
     SL_DEBUG_LOG_V2(ERROR, "Failed to init I2C for Si70xx: 0x%lx\r\n", i2c_status);
     return;
   }
-  SL_DEBUG_LOG_V2(INFO, "I2C init for Si70xx Success\r\n");
 
-  status = sl_si91x_si70xx_init(SI70XX_I2C_INSTANCE, SI70XX_SLAVE_ADDR, SL_EID_SECOND_BYTE);
-  if (status != SL_STATUS_OK) {
-    SL_DEBUG_LOG_V2(ERROR, "Failed to init Si70xx sensor: 0x%lx\r\n", status);
+  // sl_si91x_i2c_init() leaves the block disabled. TX FIFO empty is then
+  // always true, so writes return success with no SCL, and the first read
+  // times out (0x10). Configuring the FIFO thresholds re-enables IC_ENABLE.
+  i2c_status = sl_i2c_driver_configure_fifo_threshold(SI70XX_I2C_INSTANCE, 0, 0);
+  if (i2c_status != SL_I2C_SUCCESS) {
+    SL_DEBUG_LOG_V2(ERROR, "Failed to enable I2C FIFO for Si70xx: 0x%lx\r\n", i2c_status);
     return;
   }
-  SL_DEBUG_LOG_V2(INFO, "Si70xx sensor init Success\r\n");
+
+  SL_DEBUG_LOG_V2(INFO,
+                  "I2C init for Si70xx Success en=%u\r\n",
+                  (unsigned)((I2C0_Type *)I2C2_BASE)->IC_ENABLE_b.EN);
+
+  // Reset is a single write and must end with STOP. Combined write-then-read
+  // (EID / hold-master measure) is handled inside si70xx_float.c.
+  status = sl_si91x_si70xx_reset(SI70XX_I2C_INSTANCE, SI70XX_SLAVE_ADDR);
+  if (status != SL_STATUS_OK) {
+    SL_DEBUG_LOG_V2(ERROR, "Failed to reset Si70xx sensor: 0x%lx\r\n", status);
+    return;
+  }
+  osDelay(SI70XX_POWER_ON_DELAY_MS);
 
   uint8_t device_id = 0;
   status            = si70xx_float_read_device_id(SI70XX_I2C_INSTANCE, SI70XX_SLAVE_ADDR, &device_id);
@@ -321,27 +876,21 @@ static void application_start(void *argument)
                     (unsigned long)SI70XX_DEVICE_ID_SI7021);
   }
 
+  status = adc_ch1_init();
+  if (status != SL_STATUS_OK) {
+    return;
+  }
+
+  mqtt_connect();
+
   if (osThreadNew((osThreadFunc_t)sensor_task, NULL, &sensor_thread_attributes) == NULL) {
     SL_DEBUG_LOG_V2(ERROR, "Failed to create the Si7021 sampling thread\r\n");
     return;
   }
 
-  status = sl_net_init(SL_NET_WIFI_CLIENT_INTERFACE, &wifi_mqtt_client_configuration, NULL, NULL);
-  if (status != SL_STATUS_OK && status != SL_STATUS_ALREADY_INITIALIZED) {
-    SL_DEBUG_LOG_V2(ERROR, "Failed to start Wi-Fi client interface: 0x%lx\r\n", status);
-    return;
+  while (!is_execution_completed) {
+    osThreadYield();
   }
-  SL_DEBUG_LOG_V2(INFO, "Wi-Fi client interface up Success\r\n");
-
-  status = sl_net_up(SL_NET_WIFI_CLIENT_INTERFACE, SL_NET_DEFAULT_WIFI_CLIENT_PROFILE_ID);
-  if (status != SL_STATUS_OK) {
-    SL_DEBUG_LOG_V2(ERROR, "Failed to bring Wi-Fi client interface up: 0x%lx\r\n", status);
-    return;
-  }
-
-  SL_DEBUG_LOG_V2(INFO, "Wi-Fi client connected\r\n");
-
-  mqtt_example();
 
   while (1) {
 #if defined(SL_CATALOG_POWER_MANAGER_PRESENT)
@@ -357,29 +906,6 @@ void mqtt_client_cleanup()
 {
   SL_CLEANUP_MALLOC(client_credentails);
   is_execution_completed = 1;
-}
-
-void mqtt_client_message_handler(void *client, sl_mqtt_client_message_t *message, void *context)
-{
-  UNUSED_PARAMETER(context);
-  sl_status_t status;
-  SL_DEBUG_LOG_V2(INFO, "Message Received on Topic: ");
-
-  print_char_buffer((char *)message->topic, message->topic_length);
-  print_char_buffer((char *)message->content, message->content_length);
-
-  // Unsubscribing to already subscribed topic.
-  status = sl_mqtt_client_unsubscribe(client,
-                                      (uint8_t *)TOPIC_TO_BE_SUBSCRIBED,
-                                      strlen(TOPIC_TO_BE_SUBSCRIBED),
-                                      0,
-                                      TOPIC_TO_BE_SUBSCRIBED);
-  if (status != SL_STATUS_IN_PROGRESS) {
-    SL_DEBUG_LOG_V2(ERROR, "Failed to unsubscribe : 0x%lx\r\n", status);
-
-    mqtt_client_cleanup();
-    return;
-  }
 }
 
 void print_char_buffer(char *buffer, uint32_t buffer_length)
@@ -440,34 +966,13 @@ void mqtt_client_event_handler(void *client, sl_mqtt_client_event_t event, void 
 {
   switch (event) {
     case SL_MQTT_CLIENT_CONNECTED_EVENT: {
-      sl_status_t status;
-
-      status = sl_mqtt_client_subscribe(client,
-                                        (uint8_t *)TOPIC_TO_BE_SUBSCRIBED,
-                                        strlen(TOPIC_TO_BE_SUBSCRIBED),
-                                        QOS_OF_SUBSCRIPTION,
-                                        0,
-                                        mqtt_client_message_handler,
-                                        TOPIC_TO_BE_SUBSCRIBED);
-      if (status != SL_STATUS_IN_PROGRESS) {
-        SL_DEBUG_LOG_V2(ERROR, "Failed to subscribe : 0x%lx\r\n", status);
-
-        mqtt_client_cleanup();
-        return;
-      }
-
-      status = sl_mqtt_client_publish(client, &message_to_be_published, 0, &message_to_be_published);
-      if (status != SL_STATUS_IN_PROGRESS) {
-        SL_DEBUG_LOG_V2(ERROR, "Failed to publish message: 0x%lx\r\n", status);
-
-        mqtt_client_cleanup();
-        return;
-      }
-
+      mqtt_is_connected = 1;
+      SL_DEBUG_LOG_V2(INFO, "Connected to MQTT broker\r\n");
       break;
     }
 
     case SL_MQTT_CLIENT_MESSAGE_PUBLISHED_EVENT: {
+      mqtt_publish_busy = 0;
       sl_mqtt_client_message_t *published_message = (sl_mqtt_client_message_t *)context;
 
       SL_DEBUG_LOG_V2(INFO, "Published message successfully on topic: ");
@@ -475,26 +980,10 @@ void mqtt_client_event_handler(void *client, sl_mqtt_client_event_t event, void 
       break;
     }
 
-    case SL_MQTT_CLIENT_SUBSCRIBED_EVENT: {
-      char *subscribed_topic = (char *)context;
-
-      SL_DEBUG_LOG_V2(INFO, "Subscribed to Topic: %s\r\n", (uintptr_t)subscribed_topic);
-      break;
-    }
-
-    case SL_MQTT_CLIENT_UNSUBSCRIBED_EVENT: {
-      char *unsubscribed_topic = (char *)context;
-
-      SL_DEBUG_LOG_V2(INFO, "Unsubscribed from topic: %s\r\n", (uintptr_t)unsubscribed_topic);
-
-      sl_mqtt_client_disconnect(client, 0);
-      break;
-    }
-
     case SL_MQTT_CLIENT_DISCONNECTED_EVENT: {
+      mqtt_is_connected = 0;
+      mqtt_publish_busy = 0;
       SL_DEBUG_LOG_V2(INFO, "Disconnected from MQTT broker\r\n");
-
-      mqtt_client_cleanup();
       break;
     }
 
@@ -507,7 +996,7 @@ void mqtt_client_event_handler(void *client, sl_mqtt_client_event_t event, void 
   }
 }
 
-sl_status_t mqtt_example()
+sl_status_t mqtt_connect(void)
 {
   sl_status_t status;
 
@@ -553,9 +1042,10 @@ sl_status_t mqtt_example()
 
       return status;
     }
-    SL_DEBUG_LOG_V2(INFO, "Set credentials Success  ");
+    SL_DEBUG_LOG_V2(INFO, "Set credentials Success\r\n");
 
     free(client_credentails);
+    client_credentails = NULL;
     mqtt_client_configuration.credential_id = SL_NET_MQTT_CLIENT_CREDENTIAL_ID(0);
   }
 
@@ -566,22 +1056,10 @@ sl_status_t mqtt_example()
     mqtt_client_cleanup();
     return status;
   }
-  SL_DEBUG_LOG_V2(INFO, "Init mqtt client Success \r\n");
+  SL_DEBUG_LOG_V2(INFO, "Init mqtt client Success\r\n");
 
-  sl_mqtt_client_tcp_tls_advanced_options_t mqtt_tcp_tls_opts = {
-    .tcp_keepalive_initial_time_sec   = 180,
-    .tcp_max_retry_count              = 10,
-    .max_retransmission_timeout_value = 3,
-    .ssl_ciphers_bitmap               = 0,
-    .ssl_ext_ciphers_bitmap           = 0,
-  };
-  status = sl_mqtt_client_set_tcp_tls_advanced_configuration(&client, &mqtt_tcp_tls_opts);
-  if (status != SL_STATUS_OK) {
-    SL_DEBUG_LOG_V2(ERROR, "Failed to set MQTT TCP/TLS advanced configuration: 0x%lx", status);
-    mqtt_client_cleanup();
-    return status;
-  }
-  SL_DEBUG_LOG_V2(INFO, "MQTT TCP/TLS advanced configuration set ");
+  // Intentionally skip sl_mqtt_client_set_tcp_tls_advanced_configuration():
+  // it is not used by the SDK example and is unrelated to ENCRYPT_CONNECTION.
 
 #ifdef SLI_SI91X_ENABLE_IPV6
   unsigned char hex_addr[SL_IPV6_ADDRESS_LENGTH] = { 0 };
@@ -606,21 +1084,40 @@ sl_status_t mqtt_example()
   mqtt_broker_configuration.ip.type = SL_IPV4;
 #endif
 
-  status =
-    sl_mqtt_client_connect_v2(&client, &mqtt_broker_configuration, &last_will_message, &mqtt_client_configuration, 0);
+  SL_DEBUG_LOG_V2(INFO,
+                  "MQTT broker %u.%u.%u.%u:%u encrypt=%u\r\n",
+                  mqtt_broker_configuration.ip.ip.v4.bytes[0],
+                  mqtt_broker_configuration.ip.ip.v4.bytes[1],
+                  mqtt_broker_configuration.ip.ip.v4.bytes[2],
+                  mqtt_broker_configuration.ip.ip.v4.bytes[3],
+                  (unsigned)mqtt_broker_configuration.port,
+                  (unsigned)mqtt_broker_configuration.is_connection_encrypted);
+
+  // Let DHCP/ARP settle; IP-info notify already timed out once after join.
+  osDelay(2000);
+
+  {
+    const uint32_t t0 = osKernelGetTickCount();
+    SL_DEBUG_LOG_V2(INFO, "Calling sl_mqtt_client_connect_v2 (async)...\r\n");
+    status = sl_mqtt_client_connect_v2(&client,
+                                       &mqtt_broker_configuration,
+                                       &last_will_message,
+                                       &mqtt_client_configuration,
+                                       0);
+    SL_DEBUG_LOG_V2(INFO,
+                    "connect_v2 returned 0x%lx after %lu ms\r\n",
+                    (unsigned long)status,
+                    (unsigned long)(osKernelGetTickCount() - t0));
+  }
   if (status != SL_STATUS_IN_PROGRESS) {
+    // With timeout=0 this should be IN_PROGRESS. TIMEOUT almost always means the
+    // sync firmware MQTT INIT (TCP open to the broker) failed, not MQTT AUTH.
     SL_DEBUG_LOG_V2(ERROR, "Failed to connect to mqtt broker: 0x%lx\r\n", status);
 
     mqtt_client_cleanup();
     return status;
   }
-  SL_DEBUG_LOG_V2(INFO, "Connect to mqtt broker Success \r\n");
-
-  while (!is_execution_completed) {
-    osThreadYield();
-  }
-
-  SL_DEBUG_LOG_V2(INFO, "Example execution completed \r\n");
+  SL_DEBUG_LOG_V2(INFO, "Connect to mqtt broker started (await CONNECTED event)\r\n");
 
   return SL_STATUS_OK;
 }

@@ -1,4 +1,5 @@
 {
+    "silabs.buildBeforeFlash": true,
     "cmake.sourceDirectory": "C:/w/cmake_gcc",
     // CMake is installed by the Silicon Labs SLT tooling rather than system-wide,
     // so it is not on PATH. Ninja and arm-none-eabi-gcc are resolved by

@@ -46,13 +46,8 @@ endif()
 # Force the gcc linker command
 set_target_properties(wifi_embedded_mqtt_client_soc PROPERTIES LINKER_LANGUAGE C)
 
-# Create .bin, .hex and .s37 artifacts after building the project
-add_custom_command(TARGET wifi_embedded_mqtt_client_soc
-    POST_BUILD
-    COMMAND ${CMAKE_OBJCOPY} ${OBJCOPY_SREC_CMD} "$<TARGET_FILE:wifi_embedded_mqtt_client_soc>" "$<TARGET_FILE_DIR:wifi_embedded_mqtt_client_soc>/$<TARGET_FILE_BASE_NAME:wifi_embedded_mqtt_client_soc>.s37"
-    COMMAND ${CMAKE_OBJCOPY} ${OBJCOPY_IHEX_CMD} "$<TARGET_FILE:wifi_embedded_mqtt_client_soc>" "$<TARGET_FILE_DIR:wifi_embedded_mqtt_client_soc>/$<TARGET_FILE_BASE_NAME:wifi_embedded_mqtt_client_soc>.hex"
-    COMMAND ${CMAKE_OBJCOPY} ${OBJCOPY_BIN_CMD}  "$<TARGET_FILE:wifi_embedded_mqtt_client_soc>" "$<TARGET_FILE_DIR:wifi_embedded_mqtt_client_soc>/$<TARGET_FILE_BASE_NAME:wifi_embedded_mqtt_client_soc>.bin" 
-)
+# The SiWx917 bootloader image is created by the slpb post-build (create_rps).
+# Extra hex/s37/bin copies only clutter the Silicon Labs flash file picker.
 
 # Run post-build pipeline to perform additional post-processing
 if(post_build_command)

@@ -63,7 +63,7 @@ void sl_i2c_init_instances(void)
 {
 
 
-  sl_si91x_i2c_pin_init(&sl_i2c_i2c2_pin_init);
+  // Pin mux is done in application_start() after the NWP is up.
   
   
 }
