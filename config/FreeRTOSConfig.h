@@ -135,7 +135,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //  <i> Callback function vApplicationStackOverflowHook implementation is required when stack checking is enabled.
 //  <i> Not applicable to the Win32 port.
 //  <i> Default: 0
-#define configCHECK_FOR_STACK_OVERFLOW 0
+#define configCHECK_FOR_STACK_OVERFLOW 2
 
 #if (configUSE_TICKLESS_IDLE == 1)
 

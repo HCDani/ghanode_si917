@@ -15,6 +15,10 @@
 /vscode.conf
 /trashed_modified_files/
 
+# Per-machine AI agent and editor plugin configuration
+/.codex/config.toml
+/.cursor/plugins/silabs-vscode-extension/mcp.json
+
 # Local credentials (use secret_example.h as the template)
 /secret.h
 

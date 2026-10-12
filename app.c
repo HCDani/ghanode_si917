@@ -48,10 +48,14 @@
 #include "sl_adc_instances.h"
 #include "sl_si91x_adc_common_config.h"
 #include "stdio.h"
+#include <math.h>
 #include "sl_wifi_device.h"
 #include "sl_si91x_socket_utility.h"
 #include "sl_net_ping.h"
 #include "sl_net_wifi_types.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include <stdbool.h>
 
 extern sl_i2c_pin_init_t sl_i2c_i2c2_pin_init;
 
@@ -68,29 +72,28 @@ extern sl_i2c_pin_init_t sl_i2c_i2c2_pin_init;
 #define MQTT_BROKER_PORT 1883
 #define MQTT_BROKER_HOST "yourmqtthost.com"
 
-#define CLIENT_PORT 1
-
-#define CLIENT_ID "WISECONNECT-SDK-MQTT-CLIENT-ID"
+// Local TCP port, picked fresh from this range for every connect. With a fixed
+// port, a reconnect after a Wi-Fi drop reused the 4-tuple of the session the
+// broker still held open, and every connect failed until the broker dropped it.
+#define CLIENT_PORT_MIN   49152u
+#define CLIENT_PORT_RANGE 16384u
 
 #define PUBLISH_TOPIC          "ghanode/sensor"
 #define QOS_OF_PUBLISH_MESSAGE 0
 
-// "AA:BB:CC:DD:EE:FF" + NUL
-#define SENSOR_ID_MAC_LEN 18
+// "AABBCCDDEEFF" + NUL
+#define SENSOR_ID_MAC_LEN 13
 #define MQTT_JSON_MAX_LEN 208
 
 #define IS_DUPLICATE_MESSAGE 0
 #define IS_MESSAGE_RETAINED  0
 #define IS_CLEAN_SESSION     1
 
-#define LAST_WILL_TOPIC       "WISECONNECT-SDK-MQTT-CLIENT-LAST-WILL"
-#define LAST_WILL_MESSAGE     "WISECONNECT-SDK-MQTT-CLIENT has been disconnect from network"
-#define QOS_OF_LAST_WILL      1
-#define IS_LAST_WILL_RETAINED 1
-
 #define ENCRYPT_CONNECTION     0
 #define CERTIFICATE_INDEX      1
-#define KEEP_ALIVE_INTERVAL    2000
+// Seconds. The broker drops a silent client after 1.5x this, so it also bounds
+// how long a session lost with the Wi-Fi lingers on the broker.
+#define KEEP_ALIVE_INTERVAL    60
 #define MQTT_CONNECT_TIMEOUT   5000
 #define MQTT_KEEPALIVE_RETRIES 0
 
@@ -105,14 +108,58 @@ extern sl_i2c_pin_init_t sl_i2c_i2c2_pin_init;
 
 #define SI70XX_SAMPLE_INTERVAL_MS 20000
 
+#define WIFI_RETRY_DELAY_MIN_MS 5000
+#define WIFI_RETRY_DELAY_MAX_MS 60000
+
+#define MQTT_RETRY_DELAY_MIN_MS    5000
+#define MQTT_RETRY_DELAY_MAX_MS    60000
+// A TCP connect to an unreachable broker took ~30 s to fail on the NWP. Starting
+// another connect before the first resolves left the SDK client stuck in
+// CONNECTION_FAILED, so the wait must outlast that.
+#define MQTT_CONNECT_WAIT_MS       60000
+#define MQTT_PUBLISH_WAIT_MS       10000
+#define MQTT_PUBLISH_REJECT_LIMIT  3
+#define MQTT_PUBLISH_RETRY_MS      1000
+#define MQTT_DISCONNECT_TIMEOUT_MS 5000
+// Connect failures right after a Wi-Fi restart before the MCU is reset. A
+// broker that is really down costs at most one reset this way.
+#define MQTT_FAILS_AFTER_RECOVERY  3
+
+// Readings kept while the broker is unreachable: 30 x 20 s = 10 minutes.
+#define READING_QUEUE_LENGTH 30
+
+// Stack high-water marks are logged after the first sample, then hourly.
+#define STACK_REPORT_EVERY_N_SAMPLES (3600000u / SI70XX_SAMPLE_INTERVAL_MS)
+
+// net_events bits. Set by the sensor task, the MQTT callbacks and the Wi-Fi
+// join callback; waited on by the network loop.
+#define NET_EVT_READING        (1UL << 0)
+#define NET_EVT_MQTT_UP        (1UL << 1)
+#define NET_EVT_MQTT_DOWN      (1UL << 2)
+#define NET_EVT_PUBLISHED      (1UL << 3)
+#define NET_EVT_PUBLISH_FAILED (1UL << 4)
+#define NET_EVT_WIFI_DOWN      (1UL << 5)
+
 #define ADC_VREF_VOLTS 3.3f
+
+// GL5528 LDR from GPIO_25 to GND, 4.7 kOhm pull-up to the ADC reference:
+// V = VREF * R_ldr / (R_ldr + R_pullup).
+#define LDR_PULLUP_OHMS 4700.0f
+// GL5528 datasheet: 10-20 kOhm at 10 lux, gamma 0.7 (10 to 100 lux). The reading
+// is used against a 2000 lux threshold; part-to-part spread moves that point to
+// 1300-3600 lux, so set R10 from a lux meter reading near 2000 lux.
+#define LDR_R10_OHMS  15000.0f
+#define LDR_GAMMA     0.7f
+#define LIGHT_LUX_MAX 100000
 
 /******************************************************
  *               Variable Definitions
  ******************************************************/
 
+// Bring-up, then the network loop. Formatting the JSON with %f pulls in the
+// newlib float formatter.
 const osThreadAttr_t thread_attributes = {
-  .name       = "app",
+  .name       = "net",
   .attr_bits  = 0,
   .cb_mem     = 0,
   .cb_size    = 0,
@@ -122,7 +169,7 @@ const osThreadAttr_t thread_attributes = {
   .tz_module  = 0,
 };
 
-// Sized for printf with %f, which pulls in the newlib float formatter.
+// Above the network loop so a slow reconnect never delays a sample.
 const osThreadAttr_t sensor_thread_attributes = {
   .name       = "sensor",
   .attr_bits  = 0,
@@ -130,7 +177,7 @@ const osThreadAttr_t sensor_thread_attributes = {
   .cb_size    = 0,
   .stack_mem  = 0,
   .stack_size = 2048,
-  .priority   = osPriorityLow,
+  .priority   = osPriorityBelowNormal,
   .tz_module  = 0,
 };
 
@@ -184,23 +231,37 @@ static const sl_wifi_device_configuration_t wifi_mqtt_client_configuration = {
 
 sl_mqtt_client_t client = { 0 };
 
-uint8_t is_execution_completed = 0;
-static volatile uint8_t mqtt_is_connected  = 0;
-static volatile uint8_t mqtt_publish_busy  = 0;
+typedef struct {
+  float temperature_c;
+  float humidity_pct;
+  int light_lux;
+} sensor_reading_t;
+
+static osMessageQueueId_t reading_queue = NULL;
+static osEventFlagsId_t net_events      = NULL;
+static osThreadId_t net_thread          = NULL;
+static osThreadId_t sensor_thread       = NULL;
+
+// Written by the stack overflow hook for a debugger to read.
+const char *volatile stack_overflow_task = NULL;
+
 static char mqtt_json_payload[MQTT_JSON_MAX_LEN];
-static char sensor_id_mac[SENSOR_ID_MAC_LEN] = "00:00:00:00:00:00";
+static char sensor_id_mac[SENSOR_ID_MAC_LEN] = "000000000000";
 
 sl_mqtt_client_credentials_t *client_credentails = NULL;
 
 sl_mqtt_client_configuration_t mqtt_client_configuration = { .is_clean_session = IS_CLEAN_SESSION,
-                                                             .client_id        = (uint8_t *)CLIENT_ID,
-                                                             .client_id_length = strlen(CLIENT_ID),
+                                                             // The broker drops an existing session when another
+                                                             // client connects with the same ID, so each node
+                                                             // uses its own STA MAC (filled in before connect).
+                                                             .client_id        = (uint8_t *)sensor_id_mac,
+                                                             .client_id_length = SENSOR_ID_MAC_LEN - 1,
 #if ENCRYPT_CONNECTION
                                                              .tls_flags = SL_MQTT_TLS_ENABLE | SL_MQTT_TLS_TLSV_1_2
                                                                           | SL_MQTT_TLS_CERT_INDEX_1
                                                                           | SL_MQTT_TLS_SNI_ENABLE,
 #endif
-                                                             .client_port = CLIENT_PORT };
+                                                             .client_port = CLIENT_PORT_MIN };
 
 sl_mqtt_broker_v2_t mqtt_broker_configuration = {
   .port                    = MQTT_BROKER_PORT,
@@ -228,26 +289,31 @@ sl_mqtt_client_message_t message_to_be_published = {
   .content_length       = 0,
 };
 
-sl_mqtt_client_last_will_message_t last_will_message = {
-  .is_retained         = IS_LAST_WILL_RETAINED,
-  .will_qos_level      = QOS_OF_LAST_WILL,
-  .will_topic          = (uint8_t *)LAST_WILL_TOPIC,
-  .will_topic_length   = strlen(LAST_WILL_TOPIC),
-  .will_message        = (uint8_t *)LAST_WILL_MESSAGE,
-  .will_message_length = strlen(LAST_WILL_MESSAGE),
-};
-
 /******************************************************
  *               Function Declarations
  ******************************************************/
 static void application_start(void *argument);
 static void sensor_task(void *argument);
+static void enqueue_reading(const sensor_reading_t *reading);
+static void log_stack_high_water(void);
+static uint32_t next_retry_delay(uint32_t delay_ms, uint32_t max_ms);
+static void wifi_join(void);
+static sl_status_t wifi_join_callback(sl_wifi_event_t event,
+                                      sl_status_t status_code,
+                                      char *data,
+                                      uint32_t data_length,
+                                      void *arg);
+static void network_loop(void);
+static sl_status_t mqtt_setup(void);
+static sl_status_t mqtt_connect_and_wait(void);
+static sl_status_t publish_until_disconnected(sensor_reading_t *pending, bool *has_pending, bool *published);
+static void recover_or_reset(const char *reason, bool *recovered_once);
 static sl_status_t si70xx_enable_sensor(void);
 static void adc_event_callback(uint8_t channel, uint8_t event);
 static sl_status_t adc_ch1_init(void);
 static sl_status_t adc_ch1_read_volts(float *volts);
-static void format_sensor_timestamp(char *buf, size_t buf_len);
-static void publish_sensor_json(float temperature_c, float humidity_pct, int light);
+static int ldr_volts_to_lux(float volts);
+static sl_status_t publish_reading(const sensor_reading_t *reading);
 static sl_status_t wifi_scan_callback(sl_wifi_event_t event,
                                       sl_wifi_scan_result_t *result,
                                       uint32_t result_length,
@@ -258,11 +324,11 @@ static sl_status_t network_event_handler(sl_net_event_t event, sl_status_t statu
 static void dump_station_ip_config(void);
 static void icmp_probe_gateway(void);
 static void network_tcp_prepare(void);
+static void mqtt_release_nwp_client(void);
 void mqtt_client_event_handler(void *client, sl_mqtt_client_event_t event, void *event_data, void *context);
 void mqtt_client_error_event_handler(void *client, sl_mqtt_client_error_status_t *error);
 void mqtt_client_cleanup();
 void print_char_buffer(char *buffer, uint32_t buffer_length);
-sl_status_t mqtt_connect(void);
 
 /******************************************************
  *               Function Definitions
@@ -355,6 +421,9 @@ static void dump_nearby_access_points(void)
 
   if (wifi_scan_sem == NULL) {
     wifi_scan_sem = osSemaphoreNew(1, 0, NULL);
+  }
+  // A scan that timed out on a previous attempt may still have released it.
+  while (osSemaphoreAcquire(wifi_scan_sem, 0) == osOK) {
   }
 
   sl_wifi_set_scan_callback(wifi_scan_callback, NULL);
@@ -521,83 +590,134 @@ static sl_status_t adc_ch1_read_volts(float *volts)
   return SL_STATUS_OK;
 }
 
-static void format_sensor_timestamp(char *buf, size_t buf_len)
+// LDR power law: R = R10 * (lux / 10)^-gamma, inverted for lux.
+static int ldr_volts_to_lux(float volts)
 {
-  // No NTP yet (NWP timesync failed during init). Stamp uptime as HH:MM:SS
-  // on today's build date, using the offset style from the requested JSON.
-  const uint32_t total_sec = osKernelGetTickCount() / 1000u;
-  const uint32_t hh        = (total_sec / 3600u) % 24u;
-  const uint32_t mm        = (total_sec / 60u) % 60u;
-  const uint32_t ss        = total_sec % 60u;
-  snprintf(buf, buf_len, "2026-10-06T%02lu:%02lu:%02luZ+200", (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
-}
-
-static void publish_sensor_json(float temperature_c, float humidity_pct, int light)
-{
-  char timestamp[40];
-  int n;
-
-  if ((mqtt_is_connected == 0u) || (mqtt_publish_busy != 0u)) {
-    return;
+  // A full-scale reading means an open LDR or total darkness.
+  if (volts >= ADC_VREF_VOLTS * 0.999f) {
+    return 0;
+  }
+  if (volts <= 0.0f) {
+    return LIGHT_LUX_MAX;
   }
 
-  format_sensor_timestamp(timestamp, sizeof(timestamp));
+  const float r_ldr = LDR_PULLUP_OHMS * volts / (ADC_VREF_VOLTS - volts);
+  const float lux   = 10.0f * powf(LDR_R10_OHMS / r_ldr, 1.0f / LDR_GAMMA);
+  if (lux >= (float)LIGHT_LUX_MAX) {
+    return LIGHT_LUX_MAX;
+  }
+  return (int)(lux + 0.5f);
+}
+
+// The payload buffer must stay untouched until the PUBLISHED event; the
+// network loop waits for it before formatting the next reading.
+static sl_status_t publish_reading(const sensor_reading_t *reading)
+{
+  int n;
+
   n = snprintf(mqtt_json_payload,
                sizeof(mqtt_json_payload),
-               "{\"Sensor ID\": \"%s\", \"timestamp\":\"%s\", \"temperature\":%.1f, \"humidity\": %d, \"light\": %d}",
+               "{\"Sensor ID\": \"%s\", \"temperature\":%.1f, \"humidity\": %d, \"light\": %d}",
                sensor_id_mac,
-               timestamp,
-               temperature_c,
-               (int)(humidity_pct + (humidity_pct >= 0.0f ? 0.5f : -0.5f)),
-               light);
+               reading->temperature_c,
+               (int)(reading->humidity_pct + (reading->humidity_pct >= 0.0f ? 0.5f : -0.5f)),
+               reading->light_lux);
   if ((n <= 0) || ((size_t)n >= sizeof(mqtt_json_payload))) {
     printf("MQTT JSON format failed\r\n");
-    return;
+    return SL_STATUS_INVALID_PARAMETER;
   }
 
   message_to_be_published.content        = (uint8_t *)mqtt_json_payload;
   message_to_be_published.content_length = (uint16_t)n;
-  mqtt_publish_busy                      = 1;
   sl_status_t status = sl_mqtt_client_publish(&client, &message_to_be_published, 0, &message_to_be_published);
-  if (status != SL_STATUS_IN_PROGRESS) {
-    mqtt_publish_busy = 0;
-    printf("MQTT publish failed: 0x%lx\r\n", (unsigned long)status);
-    return;
+  if (status == SL_STATUS_IN_PROGRESS) {
+    printf("MQTT publish: %s\r\n", mqtt_json_payload);
   }
-  printf("MQTT publish: %s\r\n", mqtt_json_payload);
+  return status;
 }
 
-// Runs independently of Wi-Fi and MQTT so readings keep coming even when the
-// network is down. stdio is retargeted to the VCOM iostream instance.
+// Full queue means the broker has been away for a while; keep the newest
+// readings. Only this task puts, so the get-then-put cannot be overtaken.
+static void enqueue_reading(const sensor_reading_t *reading)
+{
+  if (osMessageQueuePut(reading_queue, reading, 0, 0) != osOK) {
+    sensor_reading_t oldest;
+    (void)osMessageQueueGet(reading_queue, &oldest, NULL, 0);
+    (void)osMessageQueuePut(reading_queue, reading, 0, 0);
+    printf("Reading queue full, dropped the oldest reading\r\n");
+  }
+  osEventFlagsSet(net_events, NET_EVT_READING);
+}
+
+static void log_stack_high_water(void)
+{
+  printf("Stack unused at high-water: net %lu of %lu B, sensor %lu of %lu B\r\n",
+         (unsigned long)osThreadGetStackSpace(net_thread),
+         (unsigned long)thread_attributes.stack_size,
+         (unsigned long)osThreadGetStackSpace(sensor_thread),
+         (unsigned long)sensor_thread_attributes.stack_size);
+}
+
+// Producer: samples on a fixed period and never touches the network, so
+// readings keep coming while Wi-Fi or the broker is down. stdio is retargeted
+// to the VCOM iostream instance.
 static void sensor_task(void *argument)
 {
   UNUSED_PARAMETER(argument);
+  uint32_t next_wake = osKernelGetTickCount();
+  uint32_t samples   = 0;
+
+  // This task outranks its creator, so it runs before osThreadNew() returns
+  // the handle to application_start.
+  sensor_thread = osThreadGetId();
 
   while (1) {
-    float humidity_pct  = 0.0f;
-    float temperature_c = 0.0f;
-    float adc_volts     = 0.0f;
-    int light           = 0;
+    sensor_reading_t reading = { 0 };
+    float adc_volts          = 0.0f;
     sl_status_t status;
 
-    status = si70xx_float_measure_rh_and_temp(SI70XX_I2C_INSTANCE, SI70XX_SLAVE_ADDR, &humidity_pct, &temperature_c);
+    status = si70xx_float_measure_rh_and_temp(SI70XX_I2C_INSTANCE,
+                                              SI70XX_SLAVE_ADDR,
+                                              &reading.humidity_pct,
+                                              &reading.temperature_c);
     if (status == SL_STATUS_OK) {
-      printf("Si7021: %.2f C, %.2f %%RH\r\n", temperature_c, humidity_pct);
+      printf("Si7021: %.2f C, %.2f %%RH\r\n", reading.temperature_c, reading.humidity_pct);
+
+      status = adc_ch1_read_volts(&adc_volts);
+      if (status == SL_STATUS_OK) {
+        reading.light_lux = ldr_volts_to_lux(adc_volts);
+        printf("ADC CH1 GPIO_25: %.3f V, %d lux\r\n", adc_volts, reading.light_lux);
+      } else {
+        printf("ADC CH1: read failed, 0x%lx\r\n", (unsigned long)status);
+      }
+      enqueue_reading(&reading);
     } else {
-      printf("Si7021: measurement failed, 0x%lx\r\n", (unsigned long)status);
+      // A failed measurement leaves 0 C / 0 %RH, which would pass the
+      // pipeline's numeric check as a real reading.
+      printf("Si7021: measurement failed, 0x%lx, reading skipped\r\n", (unsigned long)status);
     }
 
-    status = adc_ch1_read_volts(&adc_volts);
-    if (status == SL_STATUS_OK) {
-      light = (int)(adc_volts * 1000.0f + (adc_volts >= 0.0f ? 0.5f : -0.5f));
-      printf("ADC CH1 GPIO_25: %.3f V\r\n", adc_volts);
-      publish_sensor_json(temperature_c, humidity_pct, light);
-    } else {
-      printf("ADC CH1: read failed, 0x%lx\r\n", (unsigned long)status);
-      publish_sensor_json(temperature_c, humidity_pct, 0);
+    if ((samples % STACK_REPORT_EVERY_N_SAMPLES) == 0u) {
+      log_stack_high_water();
     }
+    samples++;
 
-    osDelay(SI70XX_SAMPLE_INTERVAL_MS);
+    // osDelayUntil keeps the period at exactly 20 s regardless of how long the
+    // I2C and ADC reads took.
+    next_wake += SI70XX_SAMPLE_INTERVAL_MS;
+    osDelayUntil(next_wake);
+  }
+}
+
+// Called by the kernel (configCHECK_FOR_STACK_OVERFLOW 2) at a context switch
+// once a task has written past its stack. Memory is already corrupt, so only
+// record the task name for a debugger and stop, matching configASSERT.
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  UNUSED_PARAMETER(xTask);
+  stack_overflow_task = pcTaskName;
+  taskDISABLE_INTERRUPTS();
+  for (;;) {
   }
 }
 
@@ -745,6 +865,260 @@ static void network_tcp_prepare(void)
   SL_DEBUG_LOG_V2(INFO, "TCP prepare: config_socket status=0x%lx\r\n", (unsigned long)status);
 }
 
+static uint32_t next_retry_delay(uint32_t delay_ms, uint32_t max_ms)
+{
+  return (delay_ms * 2u > max_ms) ? max_ms : delay_ms * 2u;
+}
+
+// Blocks until associated with an IP address. A failed join or DHCP handshake
+// (e.g. 0x1FF9C) is often transient. Rescan on every attempt so a node can
+// move to another AP if the first one is gone.
+static void wifi_join(void)
+{
+  const sl_wifi_advanced_client_configuration_t advanced_client_config = {
+    .max_retry_attempts      = 5,
+    .scan_interval           = 4,
+    .beacon_missed_count     = 40,
+    .first_time_retry_enable = 1,
+  };
+  uint32_t retry_delay_ms = WIFI_RETRY_DELAY_MIN_MS;
+
+  while (1) {
+    dump_nearby_access_points();
+    osDelay(500);
+
+    sl_wifi_configure_timeout(SL_WIFI_CLIENT_2_4GHZ_INTERFACE, SL_WIFI_AUTHENTICATION_ASSOCIATION_TIMEOUT, 3000);
+    sl_wifi_set_advanced_client_configuration(SL_WIFI_CLIENT_2_4GHZ_INTERFACE, &advanced_client_config);
+
+    SL_DEBUG_LOG_V2(INFO, "Joining Wi-Fi (sl_net_up)...\r\n");
+    sl_status_t status = sl_net_up(SL_NET_WIFI_CLIENT_INTERFACE, SL_NET_DEFAULT_WIFI_CLIENT_PROFILE_ID);
+    if (status == SL_STATUS_OK) {
+      break;
+    }
+    SL_DEBUG_LOG_V2(ERROR,
+                    "Failed to bring Wi-Fi client interface up: 0x%lx, retrying in %lu s\r\n",
+                    status,
+                    (unsigned long)(retry_delay_ms / 1000u));
+    osDelay(retry_delay_ms);
+    retry_delay_ms = next_retry_delay(retry_delay_ms, WIFI_RETRY_DELAY_MAX_MS);
+  }
+  SL_DEBUG_LOG_V2(INFO, "Wi-Fi client connected\r\n");
+}
+
+// After beacon loss the NWP rejoins on its own (max_retry_attempts). A failed
+// join event means it gave up, and only a fresh sl_net_up() will recover.
+static sl_status_t wifi_join_callback(sl_wifi_event_t event,
+                                      sl_status_t status_code,
+                                      char *data,
+                                      uint32_t data_length,
+                                      void *arg)
+{
+  UNUSED_PARAMETER(data);
+  UNUSED_PARAMETER(data_length);
+  UNUSED_PARAMETER(arg);
+
+  if (SL_WIFI_CHECK_IF_EVENT_FAILED(event) || (status_code != SL_STATUS_OK)) {
+    SL_DEBUG_LOG_V2(ERROR, "Wi-Fi join event failed: 0x%lx\r\n", (unsigned long)status_code);
+    osEventFlagsSet(net_events, NET_EVT_WIFI_DOWN);
+  }
+  return SL_STATUS_OK;
+}
+
+// The NWP keeps its own MQTT client instance until it gets a deinit. Resetting
+// only the host-side struct left the next connect failing forever, so release
+// it explicitly. A dead link makes the DISCONNECT command fail, after which the
+// SDK sends only the deinit if the state is CONNECTION_FAILED.
+static void mqtt_release_nwp_client(void)
+{
+  sl_status_t status = SL_STATUS_OK;
+
+  if (client.state == SL_MQTT_CLIENT_CONNECTED) {
+    status = sl_mqtt_client_disconnect(&client, MQTT_DISCONNECT_TIMEOUT_MS);
+  }
+  if (client.state != SL_MQTT_CLIENT_DISCONNECTED) {
+    client.state = SL_MQTT_CLIENT_CONNECTION_FAILED;
+    status       = sl_mqtt_client_disconnect(&client, MQTT_DISCONNECT_TIMEOUT_MS);
+  }
+  SL_DEBUG_LOG_V2(INFO, "MQTT client released on the NWP: 0x%lx\r\n", (unsigned long)status);
+}
+
+// Consumer: owns Wi-Fi and MQTT after bring-up. Reconnects with backoff and
+// drains the reading queue only while the broker is connected.
+static void network_loop(void)
+{
+  sensor_reading_t pending;
+  bool has_pending        = false;
+  bool recovered_once           = false;
+  uint32_t fails_after_recovery = 0;
+  uint32_t retry_delay_ms       = MQTT_RETRY_DELAY_MIN_MS;
+
+  while (1) {
+    if ((osEventFlagsGet(net_events) & NET_EVT_WIFI_DOWN) != 0u) {
+      SL_DEBUG_LOG_V2(ERROR, "Wi-Fi down, rejoining\r\n");
+      mqtt_release_nwp_client();
+      (void)sl_net_down(SL_NET_WIFI_CLIENT_INTERFACE);
+      wifi_join();
+      osEventFlagsClear(net_events, NET_EVT_WIFI_DOWN);
+      dump_station_ip_config();
+      (void)sl_mqtt_client_init(&client, mqtt_client_event_handler);
+      // A rejoin after a join-failure event is a recovery too, so connects
+      // that keep failing afterwards still end in a reset.
+      recovered_once       = true;
+      fails_after_recovery = 0;
+    }
+
+    sl_status_t status = mqtt_connect_and_wait();
+    if (status == SL_STATUS_OK) {
+      bool published = false;
+      retry_delay_ms = MQTT_RETRY_DELAY_MIN_MS;
+      status         = publish_until_disconnected(&pending, &has_pending, &published);
+      if (published) {
+        recovered_once = false;
+      }
+      if (status != SL_STATUS_OK) {
+        recover_or_reset("MQTT session dead without a disconnect event", &recovered_once);
+      }
+      continue;
+    }
+
+    // Stuck client or an attempt that never resolved: retrying the connect
+    // cannot help.
+    if ((status == SL_STATUS_INVALID_STATE) || (status == SL_STATUS_TIMEOUT)) {
+      recover_or_reset("MQTT client stuck", &recovered_once);
+      continue;
+    }
+
+    // A clean failure normally means the broker is down. Right after a Wi-Fi
+    // restart it can also mean the NWP's MQTT client is wedged, which only a
+    // reset clears.
+    if (recovered_once && (++fails_after_recovery >= MQTT_FAILS_AFTER_RECOVERY)) {
+      recover_or_reset("MQTT connect keeps failing", &recovered_once);
+    }
+    SL_DEBUG_LOG_V2(ERROR, "MQTT not connected, retrying in %lu s\r\n", (unsigned long)(retry_delay_ms / 1000u));
+    // Wakes early if Wi-Fi is lost, so the rejoin is not held up by the backoff.
+    (void)osEventFlagsWait(net_events, NET_EVT_WIFI_DOWN, osFlagsWaitAny | osFlagsNoClear, retry_delay_ms);
+    retry_delay_ms = next_retry_delay(retry_delay_ms, MQTT_RETRY_DELAY_MAX_MS);
+  }
+}
+
+// Restart Wi-Fi and the MQTT client once. If that does not get a publish
+// through, reset the MCU, which is known to recover.
+static void recover_or_reset(const char *reason, bool *recovered_once)
+{
+  if (!*recovered_once) {
+    SL_DEBUG_LOG_V2(ERROR, "%s, restarting Wi-Fi and the MQTT client\r\n", reason);
+    *recovered_once = true;
+    osEventFlagsSet(net_events, NET_EVT_WIFI_DOWN);
+    return;
+  }
+  SL_DEBUG_LOG_V2(ERROR, "%s again after a Wi-Fi restart, resetting the MCU\r\n", reason);
+  osDelay(100);
+  NVIC_SystemReset();
+}
+
+static sl_status_t mqtt_connect_and_wait(void)
+{
+  static uint32_t connect_count;
+
+  osEventFlagsClear(net_events, NET_EVT_MQTT_UP | NET_EVT_MQTT_DOWN);
+
+  connect_count++;
+  mqtt_client_configuration.client_port =
+    (uint16_t)(CLIENT_PORT_MIN + ((osKernelGetTickCount() + connect_count * 7919u) % CLIENT_PORT_RANGE));
+
+  sl_status_t status =
+    sl_mqtt_client_connect_v2(&client, &mqtt_broker_configuration, NULL, &mqtt_client_configuration, 0);
+  if (status == SL_STATUS_INVALID_STATE) {
+    // A failed connect whose own cleanup also failed leaves the client outside
+    // DISCONNECTED. sl_mqtt_client_disconnect() did not clear it on the board;
+    // the network loop escalates instead.
+    SL_DEBUG_LOG_V2(ERROR, "MQTT client in wrong state\r\n");
+    return status;
+  }
+  if (status != SL_STATUS_IN_PROGRESS) {
+    // TIMEOUT almost always means the sync firmware MQTT INIT (TCP open to the
+    // broker) failed, not MQTT AUTH.
+    SL_DEBUG_LOG_V2(ERROR, "Failed to connect to mqtt broker: 0x%lx\r\n", status);
+    return status;
+  }
+
+  uint32_t flags = osEventFlagsWait(net_events,
+                                    NET_EVT_MQTT_UP | NET_EVT_MQTT_DOWN | NET_EVT_WIFI_DOWN,
+                                    osFlagsWaitAny | osFlagsNoClear,
+                                    MQTT_CONNECT_WAIT_MS);
+  if ((flags & osFlagsError) != 0u) {
+    SL_DEBUG_LOG_V2(ERROR, "MQTT CONNECTED event not received in %u ms\r\n", MQTT_CONNECT_WAIT_MS);
+    return SL_STATUS_TIMEOUT;
+  }
+  if (((flags & NET_EVT_MQTT_UP) == 0u) || ((flags & (NET_EVT_MQTT_DOWN | NET_EVT_WIFI_DOWN)) != 0u)) {
+    return SL_STATUS_FAIL;
+  }
+  return SL_STATUS_OK;
+}
+
+// Returns SL_STATUS_OK when the broker or Wi-Fi reports a disconnect, and
+// SL_STATUS_FAIL when the session is dead without any disconnect event.
+// *published is set once a publish is confirmed. A reading whose publish was
+// not confirmed stays in *pending and goes out first after the reconnect.
+static sl_status_t publish_until_disconnected(sensor_reading_t *pending, bool *has_pending, bool *published)
+{
+  const uint32_t down = NET_EVT_MQTT_DOWN | NET_EVT_WIFI_DOWN;
+  uint32_t rejections = 0;
+  uint32_t flags;
+
+  while (1) {
+    if (!*has_pending) {
+      if (osMessageQueueGet(reading_queue, pending, NULL, 0) != osOK) {
+        flags = osEventFlagsWait(net_events, NET_EVT_READING | down, osFlagsWaitAny | osFlagsNoClear, osWaitForever);
+        if (((flags & osFlagsError) != 0u) || ((flags & down) != 0u)) {
+          return SL_STATUS_OK;
+        }
+        // Cleared before draining, so a reading queued from here on sets it again.
+        osEventFlagsClear(net_events, NET_EVT_READING);
+        continue;
+      }
+      *has_pending = true;
+    }
+
+    osEventFlagsClear(net_events, NET_EVT_PUBLISHED | NET_EVT_PUBLISH_FAILED);
+    sl_status_t status = publish_reading(pending);
+    if (status == SL_STATUS_INVALID_STATE) {
+      return SL_STATUS_OK;
+    }
+    if (status != SL_STATUS_IN_PROGRESS) {
+      printf("MQTT publish failed: 0x%lx, reading dropped\r\n", (unsigned long)status);
+      *has_pending = false;
+      continue;
+    }
+
+    flags = osEventFlagsWait(net_events,
+                             NET_EVT_PUBLISHED | NET_EVT_PUBLISH_FAILED | down,
+                             osFlagsWaitAny | osFlagsNoClear,
+                             MQTT_PUBLISH_WAIT_MS);
+    if ((flags & osFlagsError) != 0u) {
+      SL_DEBUG_LOG_V2(ERROR, "MQTT publish not confirmed in %u ms\r\n", MQTT_PUBLISH_WAIT_MS);
+      return SL_STATUS_FAIL;
+    }
+    if ((flags & NET_EVT_PUBLISHED) != 0u) {
+      *has_pending = false;
+      *published   = true;
+      rejections   = 0;
+    } else if ((flags & down) != 0u) {
+      return SL_STATUS_OK;
+    } else {
+      // After a Wi-Fi drop the NWP rejected every publish while the SDK still
+      // reported CONNECTED and no disconnect event ever arrived. The reading
+      // is fine; the session is not.
+      rejections++;
+      printf("MQTT publish rejected by the NWP (%lu in a row)\r\n", (unsigned long)rejections);
+      if (rejections >= MQTT_PUBLISH_REJECT_LIMIT) {
+        return SL_STATUS_FAIL;
+      }
+      (void)osEventFlagsWait(net_events, down, osFlagsWaitAny | osFlagsNoClear, MQTT_PUBLISH_RETRY_MS);
+    }
+  }
+}
+
 static void application_start(void *argument)
 {
   UNUSED_PARAMETER(argument);
@@ -763,25 +1137,7 @@ static void application_start(void *argument)
   }
   SL_DEBUG_LOG_V2(INFO, "Wi-Fi client interface up Success\r\n");
 
-  dump_nearby_access_points();
-  osDelay(500);
-
-  sl_wifi_configure_timeout(SL_WIFI_CLIENT_2_4GHZ_INTERFACE, SL_WIFI_AUTHENTICATION_ASSOCIATION_TIMEOUT, 3000);
-  const sl_wifi_advanced_client_configuration_t advanced_client_config = {
-    .max_retry_attempts      = 5,
-    .scan_interval           = 4,
-    .beacon_missed_count     = 40,
-    .first_time_retry_enable = 1,
-  };
-  sl_wifi_set_advanced_client_configuration(SL_WIFI_CLIENT_2_4GHZ_INTERFACE, &advanced_client_config);
-
-  SL_DEBUG_LOG_V2(INFO, "Joining Wi-Fi (sl_net_up)...\r\n");
-  status = sl_net_up(SL_NET_WIFI_CLIENT_INTERFACE, SL_NET_DEFAULT_WIFI_CLIENT_PROFILE_ID);
-  if (status != SL_STATUS_OK) {
-    SL_DEBUG_LOG_V2(ERROR, "Failed to bring Wi-Fi client interface up: 0x%lx\r\n", status);
-    return;
-  }
-  SL_DEBUG_LOG_V2(INFO, "Wi-Fi client connected\r\n");
+  wifi_join();
 
   {
     sl_mac_address_t sta_mac          = { 0 };
@@ -792,7 +1148,7 @@ static void application_start(void *argument)
     if (sl_wifi_get_mac_address(SL_WIFI_CLIENT_INTERFACE, &sta_mac) == SL_STATUS_OK) {
       snprintf(sensor_id_mac,
                sizeof(sensor_id_mac),
-               "%02X:%02X:%02X:%02X:%02X:%02X",
+               "%02X%02X%02X%02X%02X%02X",
                sta_mac.octet[0],
                sta_mac.octet[1],
                sta_mac.octet[2],
@@ -881,31 +1237,32 @@ static void application_start(void *argument)
     return;
   }
 
-  mqtt_connect();
+  // Created before anything that can fire a callback which sets them.
+  net_events    = osEventFlagsNew(NULL);
+  reading_queue = osMessageQueueNew(READING_QUEUE_LENGTH, sizeof(sensor_reading_t), NULL);
+  if ((net_events == NULL) || (reading_queue == NULL)) {
+    SL_DEBUG_LOG_V2(ERROR, "Failed to create the reading queue or event flags\r\n");
+    return;
+  }
+  sl_wifi_set_join_callback_v2(wifi_join_callback, NULL);
 
-  if (osThreadNew((osThreadFunc_t)sensor_task, NULL, &sensor_thread_attributes) == NULL) {
-    SL_DEBUG_LOG_V2(ERROR, "Failed to create the Si7021 sampling thread\r\n");
+  if (mqtt_setup() != SL_STATUS_OK) {
     return;
   }
 
-  while (!is_execution_completed) {
-    osThreadYield();
+  net_thread    = osThreadGetId();
+  sensor_thread = osThreadNew((osThreadFunc_t)sensor_task, NULL, &sensor_thread_attributes);
+  if (sensor_thread == NULL) {
+    SL_DEBUG_LOG_V2(ERROR, "Failed to create the sensor thread\r\n");
+    return;
   }
 
-  while (1) {
-#if defined(SL_CATALOG_POWER_MANAGER_PRESENT)
-    // Let the CPU go to sleep if the system allows it.
-    sl_power_manager_sleep();
-#else
-    osDelay(osWaitForever);
-#endif
-  }
+  network_loop();
 }
 
 void mqtt_client_cleanup()
 {
   SL_CLEANUP_MALLOC(client_credentails);
-  is_execution_completed = 1;
 }
 
 void print_char_buffer(char *buffer, uint32_t buffer_length)
@@ -955,35 +1312,48 @@ void mqtt_client_error_event_handler(void *client, sl_mqtt_client_error_status_t
       SL_DEBUG_LOG_V2(ERROR, "MQTT Error: Data corruption detected during message reassembly.");
       break;
 
+    case SL_MQTT_CLIENT_CONNECT_FAILED:
+      // The SDK has already sent the NWP deinit; the network loop retries.
+      SL_DEBUG_LOG_V2(ERROR, "MQTT Error: connect failed.\r\n");
+      osEventFlagsSet(net_events, NET_EVT_MQTT_DOWN);
+      break;
+
+    case SL_MQTT_CLIENT_PUBLISH_FAILED:
+      SL_DEBUG_LOG_V2(ERROR, "MQTT Error: publish failed.\r\n");
+      osEventFlagsSet(net_events, NET_EVT_PUBLISH_FAILED);
+      break;
+
     default:
-      SL_DEBUG_LOG_V2(ERROR, "Terminating program, Error: %d", *error);
-      mqtt_client_cleanup();
+      SL_DEBUG_LOG_V2(ERROR, "MQTT Error: %d\r\n", *error);
       break;
   }
 }
 
+// Runs on the SDK's event thread: only signal the network loop, never block.
 void mqtt_client_event_handler(void *client, sl_mqtt_client_event_t event, void *event_data, void *context)
 {
   switch (event) {
     case SL_MQTT_CLIENT_CONNECTED_EVENT: {
-      mqtt_is_connected = 1;
       SL_DEBUG_LOG_V2(INFO, "Connected to MQTT broker\r\n");
+      osEventFlagsSet(net_events, NET_EVT_MQTT_UP);
       break;
     }
 
     case SL_MQTT_CLIENT_MESSAGE_PUBLISHED_EVENT: {
-      mqtt_publish_busy = 0;
       sl_mqtt_client_message_t *published_message = (sl_mqtt_client_message_t *)context;
 
       SL_DEBUG_LOG_V2(INFO, "Published message successfully on topic: ");
       print_char_buffer((char *)published_message->topic, published_message->topic_length);
+      osEventFlagsSet(net_events, NET_EVT_PUBLISHED);
       break;
     }
 
     case SL_MQTT_CLIENT_DISCONNECTED_EVENT: {
-      mqtt_is_connected = 0;
-      mqtt_publish_busy = 0;
-      SL_DEBUG_LOG_V2(INFO, "Disconnected from MQTT broker\r\n");
+      const sl_mqtt_client_disconnection_reason_t *reason = (const sl_mqtt_client_disconnection_reason_t *)event_data;
+      SL_DEBUG_LOG_V2(INFO,
+                      "Disconnected from MQTT broker, reason %d\r\n",
+                      (reason != NULL) ? (int)*reason : -1);
+      osEventFlagsSet(net_events, NET_EVT_MQTT_DOWN);
       break;
     }
 
@@ -996,7 +1366,9 @@ void mqtt_client_event_handler(void *client, sl_mqtt_client_event_t event, void 
   }
 }
 
-sl_status_t mqtt_connect(void)
+// One-time setup: credentials, client init and broker address. Connecting is
+// left to the network loop so it can be repeated after a disconnect.
+static sl_status_t mqtt_setup(void)
 {
   sl_status_t status;
 
@@ -1095,29 +1467,6 @@ sl_status_t mqtt_connect(void)
 
   // Let DHCP/ARP settle; IP-info notify already timed out once after join.
   osDelay(2000);
-
-  {
-    const uint32_t t0 = osKernelGetTickCount();
-    SL_DEBUG_LOG_V2(INFO, "Calling sl_mqtt_client_connect_v2 (async)...\r\n");
-    status = sl_mqtt_client_connect_v2(&client,
-                                       &mqtt_broker_configuration,
-                                       &last_will_message,
-                                       &mqtt_client_configuration,
-                                       0);
-    SL_DEBUG_LOG_V2(INFO,
-                    "connect_v2 returned 0x%lx after %lu ms\r\n",
-                    (unsigned long)status,
-                    (unsigned long)(osKernelGetTickCount() - t0));
-  }
-  if (status != SL_STATUS_IN_PROGRESS) {
-    // With timeout=0 this should be IN_PROGRESS. TIMEOUT almost always means the
-    // sync firmware MQTT INIT (TCP open to the broker) failed, not MQTT AUTH.
-    SL_DEBUG_LOG_V2(ERROR, "Failed to connect to mqtt broker: 0x%lx\r\n", status);
-
-    mqtt_client_cleanup();
-    return status;
-  }
-  SL_DEBUG_LOG_V2(INFO, "Connect to mqtt broker started (await CONNECTED event)\r\n");
 
   return SL_STATUS_OK;
 }
